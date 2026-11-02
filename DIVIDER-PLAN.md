@@ -295,9 +295,13 @@ warning. Reserve tension measured: 3277 MiB Main later-reserve buys
 layer-major prefill and costs cache slots (3332->2847) and decode
 (40.8->36.8 tok/s).
 
-`--kv-resident 0` (same 11-layer config): prefill 633.9 (unchanged - the cliff
-is expert traffic, not KV), decode 31.8 (-6%): fleet keeps `--kv-resident` at
-or above the wanted context; 0 is workable, not free.
+`--kv-resident 0` (same 11-layer config): prefill 633.9, decode 31.8. CORRECTED
+after reading the flag's definition (generate.cpp:605): **0 means "all in
+VRAM" - it is the engine default, not "no streaming"**; the run measured the
+default against an explicit 32768 and the -6% was noise, not a streaming cost.
+Streaming is a positive value under the wanted context. The fleet config's
+`--kv-resident 32768` is therefore belt-and-braces for 32K context, removable
+without effect.
 
 "another GPU" audit (resolved, static): the phrase names the OPT-IN peer
 expert tier (`src/core/peer_experts.hpp`, `peer_device = -1` default - never
