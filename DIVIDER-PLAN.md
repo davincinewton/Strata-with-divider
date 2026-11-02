@@ -313,6 +313,28 @@ Polish left: `--plan` shows the roles but not the planner's split text (it is in
 the saved `divider_plan` and the engine log); `max_x1_layers` not yet a launch
 flag (planner/agent sets it); M4 (app UI) deferred as agreed.
 
+## 12.7 RAM UNDER THE FLEET, 2026-11-02 night: what actually lowers it, measured
+
+RAM-truth fleet (5,11): engine RSS 114.7 GB, system used 111 G, **avail 9 G**;
+decode 33.9, prefill 638.6.
+
+`--resident-experts` on the SAME fleet config (complement 68.42 GiB page-
+locked, excluding all 8,862 GPU-resident experts - the divider weights ARE
+out of the host copy): system used **10 G**, avail **38-41 G**, anon RSS
+4.4 GB - but decode **27.1-27.3 (-19%)** and prefill 565 (-11%). Hit rate was
+NOT the cost (80-82%, up); the cost is resident-mode's swap path itself:
+`STRATA_ADAPT_OVERLAP_RESIDENT=1` changes nothing because overlap is
+`off: not on a layer split` regardless (unmeasured upstream question: why
+resident-mode swaps cost ~19% when they replace PCIe reads on the same rig;
+single-card measured -24%, consistent).
+
+True SSD-truth (mmap arena, page cache as the fuzzy tier) stays disk-gated:
+`experts.bin` needs size+2 GiB (~104) on the pack's drive; `/` has 29 G (only
+the 158 G Q6 model is on it), the SATA DATA drive has 58 G free of 119. The
+pack is relocatable (`--pack` is a path): freeing ~50 G more on DATA (or a
+~$15 SATA drive) enables a first mmap start that writes experts.bin from the
+GGUF, and every later start maps it.
+
 ## 12. Milestones
 
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.
