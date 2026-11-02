@@ -306,6 +306,13 @@ The PCIe half is real and is the cliff's channel: `cudaHostGetDevicePointer`
 device aliases of the pinned arena (expert_source.cpp:6135+, "#588") let a GPU
 read host experts by DMA itself - what the divider stages do during prefill.
 
+**Status after this evening (M0A-M3 done):** planner (`strata_control/divider.py`),
+role in all three copies + vectors, launch wiring (`--gpu-roles 1=divider` ->
+explicit split + trim env + saved `divider_plan`), server words, 34 tests green.
+Polish left: `--plan` shows the roles but not the planner's split text (it is in
+the saved `divider_plan` and the engine log); `max_x1_layers` not yet a launch
+flag (planner/agent sets it); M4 (app UI) deferred as agreed.
+
 ## 12. Milestones
 
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.
