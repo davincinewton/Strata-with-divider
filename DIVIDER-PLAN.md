@@ -335,6 +335,47 @@ pack is relocatable (`--pack` is a path): freeing ~50 G more on DATA (or a
 ~$15 SATA drive) enables a first mmap start that writes experts.bin from the
 GGUF, and every later start maps it.
 
+## 12.8 ENGINE MOD, 2026-11-02 night: SPLIT RELEASE - the divider weights leave RAM
+
+User's finding (`top` after the resident-mode fleet): `buff/cache 116 GB` -
+every byte of the model still sat in host RAM as the mapped GGUF views, even
+though the pinned complement already excludes the GPU-resident experts. No
+setting fixes that (the resident build reads the bytes it copies THROUGH the
+mapping; `STRATA_UNBUFFERED_LOAD=1` measured: unchanged, 37 G->115 G cache as
+it copies); the release had to be in the engine.
+
+The mod (this branch, opt-in env `STRATA_SPLIT_RELEASE=1`, default path
+byte-identical): `FileExpertSource::release_layer_pages` (madvise MADV_DONTNEED
++ posix_fadvise POSIX_FADV_DONTNEED over the layer's three GGUF views, or the
+experts.bin span) + the complement build calls it per layer on the in-place
+GGUF arm (experts.bin already did this). Releasing a read-only mapping's pages
+is always correct - a later read faults them back from the file; the resident
+mode's decode reads none of them (R4 hit path), which is why nothing slowed.
+
+Fleet, same 5,11 config, same evening (2080 Ti x16 main + 3090/2080 Ti x1
+dividers, Q6_K_XL):
+
+| | resident mode | + SPLIT RELEASE |
+|---|---|---|
+| engine VmRSS | 118.0 GB | **83.4 GB** |
+| engine mapping RSS (RssFile) | 35.8 GiB | **0.5 GiB** |
+| `free` buff/cache | 116 G | **80 G** |
+| decode / prefill 16K | 27.2 / 565 | **27.7 / 577** |
+
+Divider bytes in host RAM after it: zero - not in the pinned complement
+(excludes all GPU-resident pairs), not in the mapping (0.5 GiB left), not in
+the page cache (released as the copy passed). The 80 G cache = the 68.4 GiB
+pinned complement (main's non-resident experts, by design) + non-expert pages.
+`strata launch` with divider roles now emits `STRATA_SPLIT_RELEASE=1` beside
+`STRATA_STAGE_TRIM=1` (inert without the resident mode).
+
+Not done (scope for the next engine step): the arena's RAM-truth mode keeps
+its full pinned copy - excluding whole layers THERE needs loader range-skips
++ a file-backed `blob_stable` fallback; and the complement's own -19% decode
+against the arena stays an open engine question (12.7). Builds: CUDA (75+86)
+passed; HIP/SYCL toolchains not on this rig - not built (the new code is
+platform-guarded like its neighbours, unconfirmed there).
+
 ## 12. Milestones
 
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.

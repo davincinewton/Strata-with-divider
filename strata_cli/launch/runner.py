@@ -356,7 +356,7 @@ def divider_cards(mirror: dict, roles: dict, cards: list, base: dict | None) -> 
     out["gpu"] = dp["order"]
     out["gpu_order"] = "as_given"
     out["layer_split"] = dp["layer_split"]
-    out["env_add"] = {"STRATA_STAGE_TRIM": "1"}
+    out["env_add"] = {"STRATA_STAGE_TRIM": "1", "STRATA_SPLIT_RELEASE": "1"}
     out["divider_plan"] = dp["plan_text"]
     return out
 

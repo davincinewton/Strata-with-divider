@@ -1790,6 +1790,53 @@ bool FileExpertSource::open_gguf(std::string& err) {
     return true;
 }
 
+// SPLIT RELEASE (STRATA_SPLIT_RELEASE): a layer whose experts a GPU now holds whole does not need its bytes in host
+// memory until something reads them again.  Releasing is always correct: the mapping is read-only, so a later read
+// faults the pages back from the file (slower once, never wrong).  Windows stays a no-op (no fadvise there), and
+// the measurements behind the flag are Linux.
+bool FileExpertSource::split_release_on() {
+    const char* v = std::getenv("STRATA_SPLIT_RELEASE");
+    return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+}
+
+void FileExpertSource::release_layer_pages(int64_t layer) const {
+#if !defined(_WIN32)
+    if (layer < 0 || layer >= n_layers_) return;
+    const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+    if (page == 0) return;
+    auto release_span = [&](const void* p, uint64_t bytes, int fd, uint64_t off) {
+        if (p == nullptr || bytes == 0) return;
+        const uint64_t a0 = (uint64_t) p - (uint64_t) p % page;
+        const uint64_t end = (uint64_t) p + bytes;
+        const uint64_t a1 = end % page == 0 ? end : end + page - end % page;
+        (void) madvise((void*) a0, (size_t) (a1 - a0), MADV_DONTNEED);
+#if !defined(__APPLE__)   // macOS has no posix_fadvise; the madvise above already released the mapping
+        if (fd >= 0) (void) posix_fadvise(fd, (off_t) off, (off_t) bytes, POSIX_FADV_DONTNEED);
+#else
+        (void) fd; (void) off;
+#endif
+    };
+    if (!role_ptr_.empty()) {   // the GGUF in place: the layer's three views, experts at their stride inside
+        for (int r = 0; r < 3; ++r) {
+            const size_t i = (size_t) (3 * layer + r);
+            if (i >= role_ptr_.size() || role_ptr_[i] == nullptr || (size_t) role_file_[i] >= maps_.size()) continue;
+            const Map& m = maps_[(size_t) role_file_[i]];
+            if (m.closed || m.base == nullptr) continue;
+            release_span(role_ptr_[i], role_bytes_[i] * (uint64_t) n_expert_, m.fd,
+                         (uint64_t) role_ptr_[i] - (uint64_t) m.base);
+        }
+        return;
+    }
+    if (base_ != nullptr && fd_ >= 0 && (size_t) layer < layer_offsets_.size())   // experts.bin: one span per layer
+        release_span(base_ + (size_t) layer_offsets_[layer],
+                     layer_blob_bytes_[layer] * (uint64_t) n_expert_, fd_, layer_offsets_[layer]);
+#endif
+}
+
+void FileExpertSource::release_host_layers(int64_t lo, int64_t hi) {
+    for (int64_t l = lo; l < hi; ++l) release_layer_pages(l);
+}
+
 bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     if (!direct_.empty()) {   // #286: from the drive; a failed read falls back to the mapping below
@@ -4041,6 +4088,7 @@ bool FileExpertSource::pin_cache_complement(
         release();
         return false;
     }
+    const bool split_release = split_release_on();   // SPLIT RELEASE: the GGUF in place gives its pages back too
 #endif
     std::atomic<int64_t> next_layer{0}, layers_done{0};
     std::atomic<uint64_t> copied{0};
@@ -4123,6 +4171,8 @@ bool FileExpertSource::pin_cache_complement(
                 return;
             }
 #endif
+            } else if (split_release) {   // SPLIT RELEASE: the GGUF in place gives back the pages its copy just read
+                release_layer_pages(layer);
             }
 #endif
             const int64_t done = layers_done.fetch_add(1) + 1;
