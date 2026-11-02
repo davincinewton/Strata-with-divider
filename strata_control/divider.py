@@ -35,6 +35,11 @@ MB = 1 << 20
 SLOW_LINK_GBPS = 3.0            # a measured link at or below this is a divider candidate: misses cost more there than the card earns
 MIN_DIVIDER_LAYERS = 3          # fewer whole layers and the card is not worth its own buffers (the engine's auto search asks for 3 too)
 MIN_STAGE_LAYERS = 2            # the engine's --layer-split needs K rising from 2; a stage never goes below this
+X1_RESIDENT_LAYERS_SAFE = 11    # measured (DIVIDER-PLAN.md 12.6; Q6_K_XL 48x2.11 GiB, 16K prompt, chunk 8192): with more than 11 whole
+                                # layers on ALL x1 dividers together, long-prompt prefill re-streams about 1 GiB per layer per chunk over
+                                # the x1 link although the experts are 100% resident (dmon: rx 404 MB/s, the link is the stage). Decode
+                                # keeps improving with more layers (34.5 -> 40.8 tok/s); prefill collapses (637 -> 243 -> 142 tok/s at
+                                # 11/13/15). Decode-first fleets keep the balanced split and the warning; prefill-heavy fleets cap it.
 MAX_STAGES = 8                  # SplitDrive::kMax in the engine: at most 7 helpers + the Main card
 HEAD_DRAFT_BYTES = 840 * MB     # the output head and the draft layer ride on the last card (~0.8 GB, docs/MULTI_GPU.md)
 PROMPT_BUFFER_BYTES = int(1.5 * GB)   # a stage's own prompt buffers at the default chunk (docs: "1.5 GB each at the default 2048-token chunk")
@@ -92,13 +97,15 @@ def _pick_main(cards: list[dict], explicit: Optional[int]) -> dict:
 
 def plan(cards: list[dict], model: dict, roles: Optional[dict] = None, *,
          slow_link_gbps: float = SLOW_LINK_GBPS, min_divider_layers: int = MIN_DIVIDER_LAYERS,
-         max_stages: int = MAX_STAGES) -> Optional[dict]:
+         max_stages: int = MAX_STAGES, max_x1_layers: Optional[int] = None,
+         safe_x1_layers: int = X1_RESIDENT_LAYERS_SAFE) -> Optional[dict]:
     """Work out the whole fleet: roles, the engine order, the explicit --layer-split values, the per-card budgets.
 
     `cards`  strata_control.gpu_roles cards + optional "link_gbps" (measured host->device; None = healthy/unknown)
     `model`  {"n_layers", "expert_bytes_per_layer", optional "dense_bytes_per_layer",
               "kv_bytes_per_token" (per layer, per context token), "context_tokens" (the plan is checked against it)}
     `roles`  optional explicit {"<card index>": "main"|"divider"|"helper"|"off"}; cards left out are auto.
+    `max_x1_layers`  whole layers the x1 dividers may hold in TOTAL - cap them for prefill-heavy fleets (X1_RESIDENT_LAYERS_SAFE).
 
     None when fewer than two usable cards (a lone card is not a split).
     """
@@ -211,6 +218,25 @@ def plan(cards: list[dict], model: dict, roles: Optional[dict] = None, *,
                 break
             n[i] += 1
             n[main["index"]] -= 1
+
+    # ---- 2b. the x1 prefill budget: above X1_RESIDENT_LAYERS_SAFE whole layers on ALL slow-link dividers together,
+    #      long-prompt prefill re-streams about 1 GiB per layer per chunk over the x1 link (measured: the constant) ----
+    x1 = [i for i in stages if kind[i] == "divider" and _link(by_idx[i]) is not None and _link(by_idx[i]) <= slow_link_gbps]
+    x1_total = sum(n[i] for i in x1)
+    if max_x1_layers is not None:
+        while x1_total > max(max_x1_layers, MIN_DIVIDER_LAYERS * len(x1)):
+            k = max(x1, key=lambda i: n[i])
+            if n[k] <= MIN_DIVIDER_LAYERS:
+                break
+            n[k] -= 1
+            n[main["index"]] += 1
+            x1_total -= 1
+        if x1_total > max_x1_layers:
+            warnings.append(f"the x1 dividers cannot drop below {x1_total} whole layers with {len(x1)} of them")
+    elif x1_total > safe_x1_layers:
+        warnings.append(f"the x1 dividers hold {x1_total} whole layers in total: past {safe_x1_layers} long-prompt prefill re-streams"
+                        f" about 1 GiB per layer per chunk over the x1 link (637 -> 243 -> 142 tok/s at 11/13/15 on the measured rig),"
+                        " while decode keeps improving - ask for max_x1_layers if long prompts matter more than decode speed")
 
     # ---- 3. the lead: a healthy link whenever one exists, else the slow stage with the most spare ----
     def spare(i: int, lead: bool = False) -> int:
