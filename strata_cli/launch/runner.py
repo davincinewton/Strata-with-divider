@@ -326,13 +326,48 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
     return cfg
 
 
+def divider_cards(mirror: dict, roles: dict, cards: list, base: dict | None) -> dict:
+    """Dividers asked for: the planner's sizes and link order replace the plain ones (strata_control/divider.py). Needs the
+    pack's native_experts.txt for the whole-layer sizes; without it, or without a fitting card, the plain mirror stands and
+    the saved "divider_plan" says why. Adds the explicit "layer_split" and STRATA_STAGE_TRIM=1, so a trimmed stage keeps
+    only its own dense layers - the whole point of a divider."""
+    from pathlib import Path
+    from strata_control import divider, gpu_roles
+    out = dict(mirror)
+    gpu_roles.add_speeds(cards)
+    tok = str((base or {}).get("tokenizer") or "")
+    pack = Path(tok).parent if Path(tok).name == "tokenizer" else None
+    model = divider.model_from_pack(pack) if pack and pack.is_dir() else None
+    if not model:
+        out["divider_plan"] = "divider plan: this model's pack has no native_experts.txt to size whole layers - the split stays automatic"
+        return out
+    links = divider.nvidia_link_gbps()
+    for c in cards:
+        if c.get("index") in links:
+            c["link_gbps"] = links[c["index"]]
+    dp = divider.plan(cards, model, {int(k): v for k, v in roles.items()})
+    if not dp or not dp["layer_split"]:
+        out["divider_plan"] = (dp or {}).get("plan_text", "divider plan: no card fits whole layers")
+        return out
+    out["gpu"] = dp["order"]
+    out["gpu_order"] = "as_given"
+    out["layer_split"] = dp["layer_split"]
+    out["env_add"] = {"STRATA_STAGE_TRIM": "1"}
+    out["divider_plan"] = dp["plan_text"]
+    return out
+
+
 def apply_cards(cfg: dict, gpus: "list[int] | dict | None") -> None:
     """The graphics cards of THIS launch go into its run config, whatever card the model was installed with (no reinstall): one card is a number,
     several are a list with the automatic layer split. None: the installed config's own choice stays.  A dict is the roles of every card
-    (strata_control/gpu_roles.mirror: "gpu_roles" plus the legacy "gpu" with the Main card last)."""
+    (strata_control/gpu_roles.mirror: "gpu_roles" plus the legacy "gpu" with the Main card last; a divider plan adds "layer_split" and "env_add")."""
     if isinstance(gpus, dict):
         for k in ("gpu", "gpu_order", "gpu_none", "gpu_roles", "gpu_cards"):
             cfg.pop(k, None)
+        gpus = dict(gpus)
+        env_add = gpus.pop("env_add", None)                  # the planner's environment (STRATA_STAGE_TRIM), merged into the config's own
+        if env_add:
+            cfg["env"] = {**(cfg.get("env") or {}), **env_add}
         cfg.update(gpus)
         cfg["gpus_asked"] = True
         cfg.pop("hip_ordinal", None)
@@ -386,7 +421,10 @@ def cards_for_launch(s: S.LaunchSettings, catalog, ram_gb: float | None = None, 
             cards = gpu_roles.rows(comp.gpus, comp.engine_vendor)
             named = {int(k): v for k, v in s.gpu_roles.items()}
             roles = gpu_roles.normalize({int(c.get("index", 0)): named.get(int(c.get("index", 0)), "off") for c in cards}, cards)
-            return gpu_roles.mirror(roles, cards)
+            mirror = gpu_roles.mirror(roles, cards)
+            if "divider" in roles.values():                  # whole layers on the slow cards: the planner sizes and orders the split (strata_control/divider.py)
+                mirror = divider_cards(mirror, roles, cards, base)
+            return mirror
         except Exception:                                    # noqa: BLE001 - never block a launch over the choice of cards
             return None
     if s.gpus:

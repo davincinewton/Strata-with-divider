@@ -1,9 +1,12 @@
 /**
  * The host's copy of the roles rules it needs to WRITE a model's settings (src/lib/gpu-roles.ts has the screen's, strata_control/gpu_roles.py the
  * Terminal's and the server's; tests/data/gpu_roles_vectors.json is run against all three).
- * Roles are { [card number]: 'main' | 'helper' | 'off' }. The engine takes the cards in stage order: Helpers, then the Main card LAST.
+ * Roles are { [card number]: 'main' | 'helper' | 'divider' | 'off' }. The engine takes the cards in stage order: the cards that are on but not
+ * Main, then the Main card LAST. A Divider (whole layers, pinned experts; strata_control/divider.py sizes it) orders like a Helper here - its
+ * LINK order is the planner's decision, this is the plain fallback.
  */
-export const ROLES = ['main', 'helper', 'off'];
+export const ROLES = ['main', 'helper', 'divider', 'off'];
+const NON_MAIN_ON = ['helper', 'divider'];
 const mem = c => Number(c.vram_gb) || 0;
 const speed = c => (typeof c.speed === 'number' && c.speed > 0 ? c.speed : 0);
 const nums = roles => Object.keys(roles).map(Number).sort((a, b) => a - b);
@@ -38,7 +41,7 @@ export function normalize(roles, cards) {
 export function order(roles, cards) {
   const cs = new Map(cards.map(c => [c.index, c]));
   const r = normalize(roles, cards);
-  const helpers = nums(r).filter(i => r[i] === 'helper').sort((a, b) => speed(cs.get(a)) - speed(cs.get(b)) || a - b);
+  const helpers = nums(r).filter(i => NON_MAIN_ON.includes(r[i])).sort((a, b) => speed(cs.get(a)) - speed(cs.get(b)) || a - b);
   return [...helpers, ...nums(r).filter(i => r[i] === 'main')];
 }
 

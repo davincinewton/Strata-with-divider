@@ -2,14 +2,18 @@
  * Main / Helper / Off for every graphics card. The same rules as strata_control/gpu_roles.py (the Terminal, setup and the server); both run
  * tests/data/gpu_roles_vectors.json.
  *
- *  - Main:   the card that runs the LAST stage of the layer split (the output head, the draft layer and the check of its guesses). Exactly one.
- *  - Helper: holds a share of the model, so more of it fits on graphics cards instead of being read from the drive.
- *  - Off:    Strata does not touch it.
+ *  - Main:    the card that runs the LAST stage of the layer split (the output head, the draft layer and the check of its guesses). Exactly one.
+ *  - Helper:  holds a share of the model, so more of it fits on graphics cards instead of being read from the drive.
+ *  - Divider: a Helper that owns COMPLETE, PINNED experts for whole layers, so its PCIe link carries no expert misses: the card
+ *             worth using behind a 1x riser. Layer counts then come from strata_control/divider.py (an explicit "layer_split"), and the
+ *             card order follows the links, not the speeds. Nothing recommends a Divider by itself - it appears only when asked for.
+ *  - Off:     Strata does not touch it.
  *
  * The engine takes the cards in stage order (`gpu: [helper, ..., main]`, `gpu_order: "as_given"`), so Main is the LAST one.
  */
-export type Role = 'main' | 'helper' | 'off';
-export const ROLES: Role[] = ['main', 'helper', 'off'];
+export type Role = 'main' | 'helper' | 'divider' | 'off';
+export const ROLES: Role[] = ['main', 'helper', 'divider', 'off'];
+export const NON_MAIN_ON: Role[] = ['helper', 'divider'];    // on but not Main: the engine takes these before the Main card
 export type Roles = Record<number, Role>;
 
 export interface RoleCard {
@@ -140,31 +144,33 @@ export function setRole(roles: Roles, cards: RoleCard[], idx: number, role: Role
     const old = ids.find(i => i !== idx && out[i] === 'main');
     out[idx] = 'main';
     if (old !== undefined) { out[old] = 'helper'; note = `old_main_helper:${old}`; }
-  } else if (role === 'helper') {
+  } else if (role === 'helper' || role === 'divider') {
     if (out[idx] === 'main') {
-      const others = fastest(ids.filter(i => i !== idx && out[i] === 'helper'));
+      const others = fastest(ids.filter(i => i !== idx && NON_MAIN_ON.includes(out[i])));
       if (!others.length) return { roles: out, note: 'only_main' };
-      out[idx] = 'helper'; out[others[0]] = 'main'; note = `promoted:${others[0]}`;
-    } else out[idx] = 'helper';
+      out[idx] = role; out[others[0]] = 'main'; note = `promoted:${others[0]}`;
+    } else out[idx] = role;
   } else {
     const wasMain = out[idx] === 'main';
     out[idx] = 'off';
     if (wasMain) {
-      const next = fastest(ids.filter(i => out[i] === 'helper'));
+      const next = fastest(ids.filter(i => NON_MAIN_ON.includes(out[i])));
       if (next.length) { out[next[0]] = 'main'; note = `promoted:${next[0]}`; }
     }
   }
   const onList = on(out);
   if (onList.length === 1) out[onList[0]] = 'main';
-  else if (onList.length && !onList.some(i => out[i] === 'main')) out[onList[0]] = 'main';
+  else if (onList.length && !onList.some(i => out[i] === 'main'))
+    out[[...onList].sort((a, b) => speed(cs.get(b)!) - speed(cs.get(a)!) || a - b)[0]] = 'main';
   return { roles: out, note };
 }
 
-/** The engine's card list: Helpers (slowest first, ties by number), then the Main card LAST; Off cards left out. */
+/** The engine's card list: the cards that are on but not Main (slowest first, ties by number - a Divider's LINK order is
+ *  strata_control/divider.py's decision, this is the plain fallback), then the Main card LAST; Off cards left out. */
 export function order(roles: Roles, cards: RoleCard[]): number[] {
   const cs = new Map(cards.map(c => [c.index, c]));
   const r = normalize(roles, cards);
-  const helpers = byNumber(r).filter(i => r[i] === 'helper').sort((a, b) => speed(cs.get(a)!) - speed(cs.get(b)!) || a - b);
+  const helpers = byNumber(r).filter(i => NON_MAIN_ON.includes(r[i])).sort((a, b) => speed(cs.get(a)!) - speed(cs.get(b)!) || a - b);
   return [...helpers, ...byNumber(r).filter(i => r[i] === 'main')];
 }
 
@@ -257,7 +263,7 @@ export function sentence(cards: RoleCard[] | null | undefined, vendor?: string |
 export function describe(roles: Roles, cards: RoleCard[]): string {
   const cs = new Map(cards.map(c => [c.index, c]));
   const parts: string[] = [];
-  for (const [role, word] of [['main', 'Main'], ['helper', 'Helper'], ['off', 'Off']] as const) {
+  for (const [role, word] of [['main', 'Main'], ['helper', 'Helper'], ['divider', 'Divider'], ['off', 'Off']] as const) {
     const names = byNumber(roles).filter(i => roles[i] === role).map(i => (cs.has(i) ? `GPU ${i + 1} ${shortName(cs.get(i)!)}` : `GPU ${i + 1}`));
     if (names.length) parts.push(`${word}: ${names.join(', ')}.`);
   }

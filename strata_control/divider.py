@@ -64,7 +64,7 @@ def _runnable(c: dict) -> bool:
 
 def _per_layer(model: dict) -> int:
     e = model["expert_bytes_per_layer"]
-    e = e[0] if isinstance(e, (list, tuple)) else int(e)
+    e = max(e) if isinstance(e, (list, tuple)) else int(e)   # the biggest whole layer: residency promises every layer fits
     return int(e) + int(model.get("dense_bytes_per_layer", 0))
 
 
@@ -266,3 +266,59 @@ def plan(cards: list[dict], model: dict, roles: Optional[dict] = None, *,
         lines.append(f"  note: {w}")
     return {"roles": {str(i): kind[i] for i in kind}, "order": order, "layer_split": layer_split,
             "stages": stage_out, "context": context, "warnings": warnings, "plan_text": "\n".join(lines)}
+
+
+# ---- the two I/O reads a live planner call needs (siblings of gpu_roles.nvidia_speeds: best effort, plain) ------------------------------
+
+def model_from_pack(pack_dir) -> Optional[dict]:
+    """{"n_layers", "expert_bytes_per_layer": [per layer]} from a native pack's native_experts.txt
+    (`layer ... offset blob ... (n_expert N, total T; ...)`); None when the pack says nothing."""
+    from pathlib import Path
+    p = Path(pack_dir) / "native_experts.txt"
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    total = None
+    rows: list[tuple[int, int]] = []
+    for ln in lines:
+        if ln.startswith("#"):
+            head = ln.split("total", 1)
+            if len(head) > 1:
+                digits = ""
+                for ch in head[1].replace(",", "").strip():
+                    if ch.isdigit():
+                        digits += ch
+                    elif digits:
+                        break
+                total = int(digits) if digits else total
+            continue
+        parts = ln.split()
+        if len(parts) >= 4 and parts[0].isdigit() and parts[3].isdigit():
+            rows.append((int(parts[0]), int(parts[3])))
+    if not rows or total is None:
+        return None
+    rows.sort()
+    bytes_per = [rows[i + 1][1] - rows[i][1] for i in range(len(rows) - 1)] + [total - rows[-1][1]]
+    return {"n_layers": len(rows), "expert_bytes_per_layer": bytes_per}
+
+
+LANE_GBPS = {1: 1.0, 2: 2.0, 3: 4.0, 4: 8.0, 5: 16.0, 6: 32.0}    # theoretical PCIe GB/s per lane by generation
+
+
+def nvidia_link_gbps(timeout: float = 15.0) -> dict[int, float]:
+    """{nvidia-smi number: host->device GB/s} from the CURRENT link width and generation (an x1 riser reads ~1 lane);
+    {} when nvidia-smi cannot say. The engine's own probe measures the real rate at start; this is the pre-start estimate."""
+    import subprocess
+    import sys
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,pcie.link.width.current,pcie.link.gen.current",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=timeout)
+        out: dict[int, float] = {}
+        for line in r.stdout.splitlines():
+            parts = [x.strip() for x in line.split(",")]
+            if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
+                out[int(parts[0])] = int(parts[1]) * LANE_GBPS.get(int(parts[2]), 4.0)
+        return out
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}

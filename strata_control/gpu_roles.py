@@ -1,9 +1,13 @@
 """Main / Helper / Off for every graphics card: ONE place for the app, `strata launch`, setup and the server.
 
-A card has one of three roles:
-* Main   - the card that runs the LAST stage of the layer split: the output head, the draft layer and the check of its guesses. Exactly one.
-* Helper - holds a share of the model, so more of it fits on graphics cards instead of being read from the drive.
-* Off    - Strata does not touch it.
+A card has one of four roles:
+* Main    - the card that runs the LAST stage of the layer split: the output head, the draft layer and the check of its guesses. Exactly one.
+* Helper  - holds a share of the model, so more of it fits on graphics cards instead of being read from the drive.
+* Divider - a Helper that owns COMPLETE, PINNED experts for whole layers, so its PCIe link carries no expert misses: the card
+            worth using behind a 1x riser. The layer counts then come from strata_control/divider.py (an explicit "layer_split"),
+            and the card order follows the links, not the speeds. Nothing recommends a Divider by itself - it needs a measured
+            link, so it appears only when the person (or the planner) asks for it.
+* Off     - Strata does not touch it.
 
 The engine takes the cards in stage order (`"gpu": [helper, ..., main]` with `"gpu_order": "as_given"`), so the Main card is the LAST one. This
 module turns roles into that list (and back), recommends roles, and words the few warnings a person could not work out alone.
@@ -18,7 +22,8 @@ from typing import Any
 
 from strata_control import gpu_fit
 
-ROLES = ("main", "helper", "off")
+ROLES = ("main", "helper", "divider", "off")
+NON_MAIN_ON = ("helper", "divider")     # a card that is on but not Main; the engine takes these before the Main card
 OFF_AT_OR_BELOW_GB = 8.0          # owner rule: a card with 8 GB or less starts Off (it is not a helper unless the person turns it on)
 SAME_SPEED = 1.05                 # serve/server.py ordered_gpus: cards within 5% of each other are the same card
 MEMORY_GUARD_SPEED = 0.5          # a card with more memory takes Main from a faster one only when it is at least half as fast (#1576)
@@ -166,21 +171,21 @@ def set_role(roles: dict[int, str], cards: list[dict], idx: int, role: str) -> t
         if old is not None:
             out[old] = "helper"
             note = f"old_main_helper:{old}"
-    elif role == "helper":
+    elif role in ("helper", "divider"):
         if out.get(idx) == "main":
-            others = sorted([i for i in out if i != idx and out[i] == "helper"], key=lambda i: (-_speed(cs[i]), i))
+            others = sorted([i for i in out if i != idx and out[i] in NON_MAIN_ON], key=lambda i: (-_speed(cs[i]), i))
             if not others:
                 return out, "only_main"
-            out[idx] = "helper"
+            out[idx] = role
             out[others[0]] = "main"
             note = f"promoted:{others[0]}"
         else:
-            out[idx] = "helper"
+            out[idx] = role
     else:
         was_main = out.get(idx) == "main"
         out[idx] = "off"
         if was_main:
-            nxt = sorted([i for i in out if out[i] == "helper"], key=lambda i: (-_speed(cs[i]), i))
+            nxt = sorted([i for i in out if out[i] in NON_MAIN_ON], key=lambda i: (-_speed(cs[i]), i))
             if nxt:
                 out[nxt[0]] = "main"
                 note = f"promoted:{nxt[0]}"
@@ -188,15 +193,16 @@ def set_role(roles: dict[int, str], cards: list[dict], idx: int, role: str) -> t
     if len(on) == 1:
         out[on[0]] = "main"
     elif on and not any(out[i] == "main" for i in on):
-        out[on[0]] = "main"
+        out[sorted(on, key=lambda i: (-_speed(cs.get(i, {})), i))[0]] = "main"
     return out, note
 
 
 def order(roles: dict[int, str], cards: list[dict]) -> list[int]:
-    """The engine's card list: Helpers (slowest first, ties by number), then the Main card LAST; Off cards left out."""
+    """The engine's card list: the cards that are on but not Main (slowest first, ties by number - a Divider's LINK
+    order is strata_control/divider.py's decision, this is the plain fallback), then the Main card LAST; Off cards left out."""
     cs = {_idx(c): c for c in cards}
     roles = normalize(roles, cards)
-    helpers = sorted([i for i, r in roles.items() if r == "helper"], key=lambda i: (_speed(cs[i]), i))
+    helpers = sorted([i for i, r in roles.items() if r in NON_MAIN_ON], key=lambda i: (_speed(cs[i]), i))
     return helpers + [i for i, r in roles.items() if r == "main"]
 
 
@@ -227,7 +233,7 @@ def parse_roles(text: str, cards: list[dict] | None = None) -> dict[int, str]:
             raise ValueError(f"{part!r}: write each card as number=role, e.g. 1=main,0=helper,2=off")
         k, v = (x.strip().lower() for x in part.split(sep, 1))
         if not k.isdigit() or v not in ROLES:
-            raise ValueError(f"{part!r}: a card number and one of main, helper, off, e.g. 1=main")
+            raise ValueError(f"{part!r}: a card number and one of main, helper, divider, off, e.g. 1=main")
         if int(k) in out:
             raise ValueError(f"card {k} is named twice")
         out[int(k)] = v
@@ -392,7 +398,7 @@ def saved_roles(cfg: dict) -> tuple[dict[int, str] | None, str | None]:
     its GPUs keeps them)."""
     roles = parse_saved(cfg.get("gpu_roles"))
     if roles is None:
-        return None, ("run settings: gpu_roles is not {card: main|helper|off} with one main; ignored" if cfg.get("gpu_roles") is not None else None)
+        return None, ("run settings: gpu_roles is not {card: main|helper|divider|off} with one main; ignored" if cfg.get("gpu_roles") is not None else None)
     try:
         gl = _int_list(cfg.get("gpu"))
     except ValueError:
@@ -409,10 +415,10 @@ def saved_roles(cfg: dict) -> tuple[dict[int, str] | None, str | None]:
 
 
 def engine_order(roles: dict[int, str], speeds: dict[int, float] | None = None) -> list[int]:
-    """The card list of saved roles for the server: Helpers slowest first (ties by number), then Main. Used where only numbers and
-    (maybe) measured speeds are known."""
+    """The card list of saved roles for the server: the cards that are on but not Main, slowest first (ties by
+    number), then Main. Used where only numbers and (maybe) measured speeds are known."""
     sp = speeds or {}
-    helpers = sorted([i for i, r in roles.items() if r == "helper"], key=lambda i: (sp.get(i, 0.0), i))
+    helpers = sorted([i for i, r in roles.items() if r in NON_MAIN_ON], key=lambda i: (sp.get(i, 0.0), i))
     return helpers + sorted(i for i, r in roles.items() if r == "main")
 
 
@@ -420,7 +426,7 @@ def describe(roles: dict[int, str], cards: list[dict]) -> str:
     """`Main: GPU 2 RTX 4070 Ti. Helper: GPU 1 RTX 3060.` (the line launch and setup print)"""
     cs = {_idx(c): c for c in cards}
     parts = []
-    for role, word in (("main", "Main"), ("helper", "Helper"), ("off", "Off")):
+    for role, word in (("main", "Main"), ("helper", "Helper"), ("divider", "Divider"), ("off", "Off")):
         names = [f"GPU {i + 1} {short_name(cs[i])}" if i in cs else f"GPU {i + 1}" for i in sorted(roles) if roles[i] == role]
         if names:
             parts.append(f"{word}: {', '.join(names)}.")
