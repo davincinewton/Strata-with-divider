@@ -1,0 +1,97 @@
+{
+  "_about": "strata_control/divider.py vectors. Byte-exact expectations frozen from the planner on the measured rig of DIVIDER-PLAN.md section 2 (real 2080 Ti / 3090 / 3060 fleet, Q6_K_XL geometry 48 x 2.11 GiB).",
+  "hw": {
+    "rig9": [
+      {"index": 0, "name": "2080 Ti", "vram_gb": 22, "speed": 105, "link_gbps": 10.9},
+      {"index": 1, "name": "3090", "vram_gb": 24, "speed": 139, "link_gbps": 0.4},
+      {"index": 2, "name": "3060", "vram_gb": 12, "speed": 60, "link_gbps": 0.4},
+      {"index": 3, "name": "2080 Ti", "vram_gb": 22, "speed": 105, "link_gbps": 0.4},
+      {"index": 4, "name": "3060", "vram_gb": 12, "speed": 60, "link_gbps": 0.4},
+      {"index": 5, "name": "3060", "vram_gb": 12, "speed": 60, "link_gbps": 0.4},
+      {"index": 6, "name": "3060", "vram_gb": 12, "speed": 60, "link_gbps": 0.4},
+      {"index": 7, "name": "3060", "vram_gb": 12, "speed": 60, "link_gbps": 0.4},
+      {"index": 8, "name": "3060", "vram_gb": 12, "speed": 60, "link_gbps": 0.4}
+    ],
+    "mixed": [
+      {"index": 0, "name": "3090", "vram_gb": 16, "speed": 90, "link_gbps": 0.5},
+      {"index": 1, "name": "4070", "vram_gb": 12, "speed": 80, "link_gbps": 12.0},
+      {"index": 2, "name": "4080", "vram_gb": 24, "speed": 130, "link_gbps": 25.0}
+    ],
+    "slow_pair": [
+      {"index": 0, "name": "4090", "vram_gb": 24, "speed": 220, "link_gbps": 25.0},
+      {"index": 1, "name": "3090", "vram_gb": 24, "speed": 139, "link_gbps": 0.4}
+    ],
+    "big_model": [
+      {"index": 0, "name": "4090", "vram_gb": 24, "speed": 220, "link_gbps": 25.0},
+      {"index": 1, "name": "3060", "vram_gb": 12, "speed": 60, "link_gbps": 0.4}
+    ],
+    "lone": [
+      {"index": 1, "name": "3090", "vram_gb": 24, "speed": 139, "link_gbps": 0.4}
+    ]
+  },
+  "model": {
+    "q6xl": {"n_layers": 48, "expert_bytes_per_layer": 2267545600},
+    "small": {"n_layers": 48, "expert_bytes_per_layer": 1073741824},
+    "huge": {"n_layers": 48, "expert_bytes_per_layer": 4294967296},
+    "with_kv": {"n_layers": 48, "expert_bytes_per_layer": 2147483648, "kv_bytes_per_token": 6000, "context_tokens": 131072}
+  },
+  "plan": [
+    {
+      "why": "all nine cards auto: Main on the healthy link, seven dividers fit whole layers, the engine's 8-stage cap drops the first 3060",
+      "rig": "rig9", "model": "q6xl",
+      "expect": {
+        "order": [3, 1, 4, 5, 6, 7, 8, 0],
+        "layer_split": "8,18,22,26,30,34,38",
+        "roles": {"0": "main", "1": "divider", "2": "off", "3": "divider", "4": "divider", "5": "divider", "6": "divider", "7": "divider", "8": "divider"},
+        "warn_any": ["at most 8 stages", "every helper is on a slow link"]
+      }
+    },
+    {
+      "why": "the manual test rig as asked: Main 0, dividers 1 and 3, the rest Off; time balance gives 9 + 10, the lead is the slow card with the most spare",
+      "rig": "rig9", "model": "q6xl",
+      "roles": {"0": "main", "1": "divider", "2": "off", "3": "divider", "4": "off", "5": "off", "6": "off", "7": "off", "8": "off"},
+      "expect": {
+        "order": [3, 1, 0],
+        "layer_split": "9,19",
+        "roles": {"0": "main", "1": "divider", "2": "off", "3": "divider", "4": "off", "5": "off", "6": "off", "7": "off", "8": "off"},
+        "warn_any": ["card 3 leads the pipeline"]
+      }
+    },
+    {
+      "why": "a healthy helper leads (stage 0 duties); it gives layers back until its own prompt buffers fit (the lead margin rule)",
+      "rig": "mixed", "model": "small",
+      "expect": {
+        "order": [1, 0, 2],
+        "layer_split": "9,22",
+        "roles": {"0": "divider", "1": "helper", "2": "main"},
+        "warn_any": ["gives back layers to fund its prompt buffers"]
+      }
+    },
+    {
+      "why": "the model's whole layer is too big for the x1 card: it is Off, the plan says so and runs on one card",
+      "rig": "big_model", "model": "huge",
+      "expect": {
+        "order": [0],
+        "layer_split": "",
+        "roles": {"0": "main", "1": "off"},
+        "warn_any": ["cannot hold 3 whole layers", "run card 0 alone"]
+      }
+    },
+    {
+      "why": "one usable card is not a split",
+      "rig": "lone", "model": "q6xl",
+      "expect": null
+    },
+    {
+      "why": "the context budget: the Main card is the tightest stage and the plan says 131072 needs a rebalance",
+      "rig": "slow_pair", "model": "with_kv",
+      "expect": {
+        "order": [1, 0],
+        "layer_split": "7",
+        "roles": {"0": "main", "1": "divider"},
+        "context_tokens": 90109,
+        "warn_any": ["needs a rebalance", "every helper is on a slow link"]
+      }
+    }
+  ]
+}
