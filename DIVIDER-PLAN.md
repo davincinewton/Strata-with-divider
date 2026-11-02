@@ -32,21 +32,28 @@ SSD holds the truth, page cache is a free fuzzy cache for the rest.
   experts total **109.2 GB** — RAM-truth arena FITS the 125 GiB host, so the
   first fleet run stays RAM-truth (0A/0B kept apart). Supersedes the v2 estimate
   (was 3.4 GB/layer, 13.5 MB blobs).
-- **GPUs (9; from user's scan):** G0 2080 Ti 22 GB **= Main**, G1 RTX 3090
-  24 GB **= divider**, G3 2080 Ti 22 GB **= divider**, G2+G4–G8 RTX 3060
-  12 GB = idle (12 GB < 1 whole layer: never dividers of this model).
+- **GPUs (9; user scan + links):** G0 2080 Ti 22 GB **x16 = Main**, G1 RTX 3090
+  24 GB **x1 = divider** (the x1 card IS the experiment), G3 2080 Ti 22 GB
+  **link unknown = divider** (confirm at start from the engine's per-stage
+  `link … GB/s` lines; rule: the best non-Main link leads stage 0), G2+G4–G8
+  RTX 3060 12 GB = idle (3060-on-riser = the future fleet tier; this model's
+  whole layer is 2.11 GiB, so 12 GB cards take max ~3 layers with tight margins).
   Both 22 GB "2080 Ti" are modded boards. CC 7.5 (Turing) = supported minimum.
-- **First test M0B config (created, committed):**
+- **First test M0B config (created):**
   `strata-unsloth-ud-q6_k_xl-split-test.json` + `run-unsloth-ud-q6_k_xl-split-test.sh`
-  — engine order `gpu: [1, 3, 0]` (`as_given`; deliberately NOT the upstream
-  slowest-first rule: fastest card leads for PLE/entry and holds the most
-  whole layers), `layer_split: "6,11"` → stage0 G1(3090) L0–5 = 12.7 GiB
-  resident, stage1 G3 L6–10 = 10.6 GiB resident, Main G0 L11–47 (78 GB experts,
-  hot cache only); `STRATA_STAGE_TRIM=1`; `--kv-resident 32768` kept from the
-  working single-card config **as a known deviation** — drop to full residency
-  once per-card links are known (3060 slots suggest mining-style board; the
-  divider links could be x4/x1: measure in O2 before judging KV streaming).
-  Port 8081 (the single-card server keeps 8080), CPU vision kept.
+  — engine order `gpu: [3, 1, 0]` (`as_given`): **ordering axis is LINK, not
+  speed** — x1 cards never lead stage 0 (entry feed + PLE + picture-reader
+  duties); the x1 3090 sits MIDDLE where a divider belongs (per-window
+  hand-offs only). `layer_split: "5,11"` → stage0 G3 L0–4 = 10.6 GiB resident,
+  stage1 G1(x1) L5–10 = 12.7 GiB resident, Main G0 L11–47 (78 GB experts, hot
+  cache only). Startup fill for G1: 12.7 GiB over x1 ≈ 10–15 s — one-time, OK.
+  (Correction logged: v1 config wrongly led with the x1 card ordering by
+  speed; quantified note: forced x1 entry is only ~10 KB/token, still not the
+  x1 killer — expert-miss streams are — but the rule stands.)
+  `STRATA_STAGE_TRIM=1`; `--kv-resident 32768` kept from the working
+  single-card config **as a known deviation** — with G1 confirmed x1, dropping
+  to `--kv-resident 0` per plan is next-run tuning once stage 0's link (G3) is
+  known. Port 8081 (single-card server keeps 8080), CPU vision kept.
 - Host: **125 GiB RAM**, NVMe root disk (**only 29 GB free** — see risk R8).
 - Baseline from the Q5_K_XL log (same rig, previous day class): decode
   **32–34 tok/s**, decode expert cache hit rate **45–58%**, KV streaming
