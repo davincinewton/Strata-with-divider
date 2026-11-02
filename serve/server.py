@@ -3609,9 +3609,9 @@ def card_roles_lines(cfg: dict) -> list[str]:
             out.append("[strata] every graphics card is Off: " + gpu_roles.CPU_ONLY_LINE)
             return out
         raise SystemExit("[strata] every graphics card is set to Off, and this engine cannot start without one. Turn a card on "
-                         "(Main or Helper) in the app or with strata launch --gpu-roles.")
-    word = {"main": "Main", "helper": "Helper", "off": "Off"}
-    out.append("[strata] card roles: " + ", ".join(f"{word[r]} GPU {i}" for r in ("main", "helper", "off")
+                         "(Main, Helper or Divider) in the app or with strata launch --gpu-roles.")
+    word = {"main": "Main", "helper": "Helper", "divider": "Divider", "off": "Off"}
+    out.append("[strata] card roles: " + ", ".join(f"{word[r]} GPU {i}" for r in ("main", "helper", "divider", "off")
                                                     for i in sorted(roles) if roles[i] == r) + " (numbers as nvidia-smi gives them)")
     return out
 

@@ -77,5 +77,29 @@ class Rules(unittest.TestCase):
         self.assertNotIn("2", r["roles"])
 
 
+class LaunchWiring(unittest.TestCase):
+    """The launch side: divider_cards sizes a real mirror, and apply_cards merges its explicit split and environment."""
+
+    def test_apply_cards_merges_env_add_and_keeps_the_explicit_split(self):
+        from strata_cli.launch.runner import apply_cards
+        cfg = {"env": {"STRATA_MMQ_KQ": "1"}, "layer_split": "auto", "gpu": 9}
+        apply_cards(cfg, {"gpu": [3, 1, 0], "gpu_order": "as_given", "gpu_roles": {"0": "main", "1": "divider", "3": "divider"},
+                          "gpu_cards": {}, "layer_split": "7,15", "env_add": {"STRATA_STAGE_TRIM": "1"}})
+        self.assertEqual(cfg["gpu"], [3, 1, 0])
+        self.assertEqual(cfg["layer_split"], "7,15")
+        self.assertEqual(cfg["env"], {"STRATA_MMQ_KQ": "1", "STRATA_STAGE_TRIM": "1"})
+        self.assertNotIn("env_add", cfg)
+
+    def test_divider_cards_without_a_native_pack_falls_back_plain(self):
+        from strata_cli.launch.runner import divider_cards
+        from strata_control import gpu_roles
+        cards = [{"index": 0, "name": "A", "vram_gb": 24, "speed": 200}, {"index": 1, "name": "B", "vram_gb": 22, "speed": 105}]
+        roles = {0: "main", 1: "divider"}
+        m = divider_cards(gpu_roles.mirror(roles, cards), roles, cards, None)
+        self.assertIn("native_experts.txt", m["divider_plan"])
+        self.assertEqual(m["gpu"], [1, 0])                     # the plain mirror stands: helper before Main
+        self.assertNotIn("env_add", m)
+
+
 if __name__ == "__main__":
     unittest.main()
