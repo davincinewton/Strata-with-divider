@@ -297,6 +297,11 @@ public:
     virtual bool wants_scores() const { return false; }
     /// Whether `warm` does anything (the predictor is not run otherwise).
     virtual bool warms() const { return false; }
+    /// SPLIT RELEASE (STRATA_SPLIT_RELEASE): the layers [lo, hi) whose experts a GPU now holds whole do not need
+    /// their bytes in host memory until something reads them again: a file-backed source releases the mapping's
+    /// pages and the drive's cache for them (a later read faults them back from the file - always correct, only
+    /// slower when something still asks).  The default does nothing.
+    virtual void release_host_layers(int64_t lo, int64_t hi) { (void) lo; (void) hi; }
 protected:
     /// What model_inputs() returns; set by a source's open().
     void record_inputs(const std::string& pack_experts, const std::string& gguf,
@@ -767,6 +772,13 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    /// SPLIT RELEASE (STRATA_SPLIT_RELEASE): releases [lo, hi)'s expert pages - the GGUF views' or the mapped
+    /// experts.bin's - and the drive's cache for them; see ExpertSource::release_host_layers.
+    void release_host_layers(int64_t lo, int64_t hi) override;
+    /// SPLIT RELEASE: the one layer's pages (the complement's copy loop uses it per layer too).
+    void release_layer_pages(int64_t layer) const;
+    /// SPLIT RELEASE: whether the environment asks for the release (read once per use, cheap).
+    static bool split_release_on();
     void close();
 
     bool mapped() const { return base_ != nullptr; }
