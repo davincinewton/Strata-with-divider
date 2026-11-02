@@ -213,6 +213,45 @@ AMD, Intel, CC<7.5, NVLink rigs).
 | R10 | Checkpoint/cell identity changes (kv mode, context, kv-resident flips) | re-plan = new sessions; document |
 | R11 | Upstream churn (~125 commits/day) | additive-only; zero engine diff unless forced; weekly rebase |
 
+## 12.5 M0B EVIDENCE — first divider runs, 2026-11-02, PASSED
+
+Links verified live: G0 **x16** (engine probe 10.9 GB/s), G1 3090 x1, G3 x1
+(all gen1-trained, probe 0.4 GB/s). Engine enumeration: server sets
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` + `CUDA_VISIBLE_DEVICES` from config `gpu` —
+CUDA numbering follows the config order, NOT nvidia-smi indices by name and
+NOT CUDA's default enumeration (which on this board lists the 3090 first;
+this caused a device-mapping scare — verify mapping only from the engine's
+own probe/CC/free-VRAM lines).
+
+Arrangement A (`gpu [3,1,0]`, `"5,11"`, `--vram-reserve-later-mib 1229`):
+- Full residency both dividers: `pre-filled 2560 of 2560` (G3, L0-4) +
+  `3072 of its 3072 profiled pairs` (G1 x1 3090, L5-10, 12.67 GiB). x1 fill
+  cost 32.8 s/card at 358 MB/s, one-time.
+- `token graph hit path: 8987 resident experts` = 2560+3072+3355 exactly;
+  `R4 hit path ON` — resident experts compute on-device, zero link traffic.
+- Decode **34.6–35.6 tok/s** steady (800 tok, drafts ~76%) vs single-card Q5
+  baseline 32–34 → **x1 dividers cost nothing; Q6_K_XL (169 GB) runs at
+  single-card-class speed.**
+- Decode expert-cache hit **78–79%** (single-card: 45–58%). KV-stream hits
+  99.8–99.9%. Main VRAM warning fixed by the reserve (239→767 MiB free;
+  uncounted ~557 MiB was HC_Q8 staging + borrowed prompt buffers).
+
+Lead-choice A/B, same day — 2080 Ti lead vs 3090 lead: **TIE**
+
+| | A (G3 lead, 5 lay) | B (3090 lead, 6 lay) |
+|---|---|---|
+| decode warm 800 tok | 34.5 tok/s | 33.9 / 34.2 tok/s |
+| prefill 16,455 tok (2 chunks) | 636.8 tok/s | 637.6 tok/s |
+| lead spare VRAM | 3347 MiB | 3064 MiB |
+
+Decode Δ−1% < draft-acceptance noise (66–77%). Prefill equal to 0.1%: x1
+lead link carries ~6.5 MB/s of chunk entry at 637 tok/s vs ~400 MB/s probed
+→ **lead choice between equal-link dividers is measurement-irrelevant; the
+only real asymmetry is VRAM margin (lead carries 5.2 GiB prompt buffers).**
+B (`[1,3,0]`, `"6,11"`) is the live config per user choice.
+Open next: `--kv-resident 0` pass; same-day single-card Q6 A/B baseline;
+"read … or from another GPU" wording audit.
+
 ## 12. Milestones
 
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.
