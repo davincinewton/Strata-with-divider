@@ -21,25 +21,41 @@ better: host RAM stops being a capacity axis entirely. A 125 GiB box can serve
 a 169 GB (or 3× bigger) model: VRAM fleet holds hot + whole resident layers,
 SSD holds the truth, page cache is a free fuzzy cache for the rest.
 
-## 2. The rig and the model (measured 2026-11-02)
+## 2. The rig and the model (updated 2026-11-02: fleet hardware revealed)
 
 - Model: `/home/bz/Strata-data/models/unsloth-UD-Q6_K_XL/…-0000{1..6}-of-00006.gguf`
   = 10.9 MB + 682 MB + 54.4 GB + 49.8 GB + 49.4 GB + 14.8 GB ≈ **169 GB**.
 - Native pack: `/home/bz/Strata-data/packs/unsloth-ud-q6_k_xl` (`dense.bin`
   1.4 GB bf16, `native_experts.txt`, tokenizer; **no `experts.bin`** — see open item O1).
+- **Geometry (exact, from `native_experts.txt`):** 48 layers × **512 experts**,
+  expert blobs **4,428,800 B**, layer total **2,267,545,600 B = 2.11 GiB/layer**,
+  experts total **109.2 GB** — RAM-truth arena FITS the 125 GiB host, so the
+  first fleet run stays RAM-truth (0A/0B kept apart). Supersedes the v2 estimate
+  (was 3.4 GB/layer, 13.5 MB blobs).
+- **GPUs (9; from user's scan):** G0 2080 Ti 22 GB **= Main**, G1 RTX 3090
+  24 GB **= divider**, G3 2080 Ti 22 GB **= divider**, G2+G4–G8 RTX 3060
+  12 GB = idle (12 GB < 1 whole layer: never dividers of this model).
+  Both 22 GB "2080 Ti" are modded boards. CC 7.5 (Turing) = supported minimum.
+- **First test M0B config (created, committed):**
+  `strata-unsloth-ud-q6_k_xl-split-test.json` + `run-unsloth-ud-q6_k_xl-split-test.sh`
+  — engine order `gpu: [1, 3, 0]` (`as_given`; deliberately NOT the upstream
+  slowest-first rule: fastest card leads for PLE/entry and holds the most
+  whole layers), `layer_split: "6,11"` → stage0 G1(3090) L0–5 = 12.7 GiB
+  resident, stage1 G3 L6–10 = 10.6 GiB resident, Main G0 L11–47 (78 GB experts,
+  hot cache only); `STRATA_STAGE_TRIM=1`; `--kv-resident 32768` kept from the
+  working single-card config **as a known deviation** — drop to full residency
+  once per-card links are known (3060 slots suggest mining-style board; the
+  divider links could be x4/x1: measure in O2 before judging KV streaming).
+  Port 8081 (the single-card server keeps 8080), CPU vision kept.
 - Host: **125 GiB RAM**, NVMe root disk (**only 29 GB free** — see risk R8).
-- GPU: not visible in this shell right now (driver down); current config names
-  1×Main + 8 slots Off — single card today.
 - Baseline from the Q5_K_XL log (same rig, previous day class): decode
   **32–34 tok/s**, decode expert cache hit rate **45–58%**, KV streaming
-  **94–95%** VRAM hits, current config uses `--kv-resident 32768`, `--kv int8`,
-  131K context, MTP `--spec 4`.
-- Derived (estimate — confirm in Phase 0A): experts ≈ 167 GB over ~48 layers →
-  **≈ 3.4 GB expert-bytes per layer, ≈ 13.5 MB per expert blob** (12288 pairs).
-  Whole-layer residency on this model: **24 GB card ≈ 5–6 layers, 16 GB ≈ 3–4,
-  12 GB ≈ 2 (too few)** → fleet cards for *this* model are ≥20 GB (used 3090
-  class), not riser-3060 class. The fleet thesis survives; the cheap-card floor
-  moves with model size. (For flash-class models the floor was much lower.)
+  **94–95%** VRAM hits, 131K context, `--kv int8`, MTP `--spec 4`.
+- **Blocker (2026-11-02 11:xx):** kernel module 595.91.07 loaded but
+  `/dev/nvidia*` nodes missing, `nvidia-modprobe` not installed, `sudo` broken
+  in this shell (`/etc/sudo.conf` owner). Root action needed, e.g.
+  `apt install --reinstall nvidia-modprobe && nvidia-modprobe -u -m -c 9`, or a
+  reboot (udev creates the nodes). Then preflight O2 before launch.
 
 ## 3. Base method: SSD keeps only truth
 
