@@ -380,6 +380,58 @@ against the arena stays an open engine question (12.7). Builds: CUDA (75+86)
 passed; HIP/SYCL toolchains not on this rig - not built (the new code is
 platform-guarded like its neighbours, unconfirmed there).
 
+## 11.9 M5 — the prefill regression, the funding bug, and the pp-first solver (design)
+
+Measured 2025-11-02 (this rig, 18,632-token prompt, engine `divider` branch):
+
+| config | ring | Main PCIe/prompt | GPU3 (middle x1)/prompt | pp |
+|---|---|---|---|---|
+| arena 5,11 131 K (roles=helper) | 384 | 204 GB | 0.7 GB (hand-offs only) | **650–661** |
+| complement 7,13 262 K, own+noborrow | 96 | 488 GB | 5.3 GB | 300.7 |
+| same + `STRATA_SPLIT_RING=384` | 384 | 211 GB | **18.9 GB** | 344 |
+| complement 7,13 + LOANS + ring 384 | 384 | 279 GB | 29.0 GB (GPU1 34.9) | 140 |
+
+The law (user's, and it fits all five rows): `pp = 8192 / max(t0, A)` where
+`t0` = Main's per-chunk time (compute + its own expert bytes / its link) and
+`A` = the interval chunks arrive from the last x1 stage. A clean x1 stage
+adds ~3-4 s/chunk (pure compute) - `A` never binds. A shaved x1 stage
+re-fetches its missing pairs mid-prompt at ~0.45 GB/s and `A` becomes the
+whole story (Y1: 8 GB/chunk ≈ 18 s late; loans: both stages → 58 s).
+Main's own clause is the ring: ring 96 re-fetches ≈ 2.4x (215 GB/chunk vs
+93 GB at ring 384) - that is the 300-vs-650 pair.
+
+**The funding bug.** In no-loan mode `split_pf_mib` (buffers + a ring booked
+as 96 slots, generate.cpp:5232-5240) is charged to EVERY stage's cache
+reserve via `stage_room`; at 262 K the KV pool leaves a divider no slack, so
+the ring is paid in the divider's EXPERTS - the divider promise (zero dynamic
+host traffic) dies exactly when a prompt runs. The engine's auto-split search
+(5317+) already computes the right quantities (`stage_left` = free − KV at
+`max_context` over the range − dense − reserve; measured links; per-layer ms)
+but optimizes DECODE window time and bills `pf` to every stage.
+
+**M5 spec (owner's directive: pp first, decode second; `layer_split` default
+`auto` = the solver; a number overrides it, engine still verifies):**
+
+- **P1 (funding):** `STRATA_PROMPT_COST_MAIN=1` → charge prompt buffers +
+  ring only to the stage that carries the drafter (Main); dividers pay zero.
+  Default off (byte-identical); the control plane injects it with the other
+  divider envs (`runner.env_add`).
+- **P2 (objective):** inside the auto search, `STRATA_SPLIT_PP=1`: hard
+  constraint per divider stage: `stage_left(lb,le) ≥ (le-lb) x 512 x
+  cost(layer)` (whole-layer residency at context K); maximize layers off
+  Main; guard `max divider stage ms <= 0.8 x Main stage ms` (Main must stay
+  fed - clause 1 of the law); the decode window time is PRINTED as an
+  advisory, never a veto. Verify mode for explicit splits: if any divider's
+  pairs exceed its room, warn loudly ("divider will re-stream over x1: drop
+  N layers or context").
+- **P3 (timing check):** after P1+P2, `A << t0` holds by construction; keep
+  the ring >= streaming working set (384 measured) funded from Main (P1);
+  validate GPU0 idle < 5% during a 26 K prompt.
+
+Validation suite: the solver must predict max-8 on a 2080 Ti divider at
+262 K, infeasibility of 7,13+ring384 with CUDA1 full residency, and `5,11`
+feasible at 131 K; the table above is the ground truth it must reproduce.
+
 ## 12. Milestones
 
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.
@@ -388,6 +440,8 @@ platform-guarded like its neighbours, unconfirmed there).
 4. **M2:** `--gpu-roles 2=divider --plan` works end to end (launch, server, status).
 5. **M3:** measurement matrix in-branch; go/no-go on Phase 3 patches.
 6. **M4 (optional):** app UI, or upstream the pure-policy pieces (fork insurance).
+7. **M5:** pp-first funding (P1) + auto-split solver (P2) + verify mode;
+   pp parity with single-GPU on the 262 K divider fleet. Gate: the 11.9 table.
 
 ## 13. Open items / questions
 
