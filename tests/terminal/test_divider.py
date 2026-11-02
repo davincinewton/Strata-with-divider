@@ -60,6 +60,18 @@ class Rules(unittest.TestCase):
         self.assertEqual(r["order"][-1], 0)
         self.assertEqual(r["roles"]["0"], "main")
 
+    def test_x1_prefill_budget_warns_and_caps(self):
+        r = D.plan(V["hw"]["rig9"], V["model"]["q6xl"], {0: "main", 1: "divider", 3: "divider", 2: "off",
+                                                         4: "off", 5: "off", 6: "off", 7: "off", 8: "off"})
+        self.assertTrue(any("x1 dividers hold" in w for w in r["warnings"]))         # 19 whole layers: balanced but warned
+        capped = D.plan(V["hw"]["rig9"], V["model"]["q6xl"], {0: "main", 1: "divider", 3: "divider", 2: "off",
+                                                              4: "off", 5: "off", 6: "off", 7: "off", 8: "off"},
+                        max_x1_layers=11)
+        total = sum(s["layers"] for s in capped["stages"] if s["role"] == "divider")
+        self.assertLessEqual(total, 11)
+        self.assertEqual(sum(s["layers"] for s in capped["stages"]), V["model"]["q6xl"]["n_layers"])
+        self.assertFalse(any("x1 dividers hold" in w for w in capped["warnings"]))
+
     def test_speedless_cards_still_plan(self):
         cards = [{"index": 0, "name": "A", "vram_gb": 24, "link_gbps": 20.0},
                  {"index": 1, "name": "B", "vram_gb": 24, "link_gbps": 0.4}]

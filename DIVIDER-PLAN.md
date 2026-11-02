@@ -257,6 +257,55 @@ B (`[1,3,0]`, `"6,11"`) is the live config per user choice.
 Open next: `--kv-resident 0` pass; same-day single-card Q6 A/B baseline;
 "read … or from another GPU" wording audit.
 
+## 12.6 PLANNER-DRIVEN FLEET, 2026-11-02 evening: decode WIN, prefill cliff found and measured
+
+The whole fleet driven by the M2 code (`--gpu-roles 1=divider,3=divider,0=main`
+-> planner -> `[3,1,0]` + explicit split + `STRATA_STAGE_TRIM=1`; a config whose
+`gpu_roles` carry `"divider"` serves as designed):
+
+| split (dividers first) | decode | prefill 16K | divider residency |
+|---|---|---|---|
+| 5+6 = 11 (manual-equivalent) | 33.9 | **638.6** | 2560/2560 + 3072/3072 |
+| 7+8 = 15 (planner-balanced) | **40.8 / 39.7** | 140.6-152.1 | 3584/3584 + 4096/4096, 11012 resident experts |
+| 5+8 = 13 | - | 243.4 | - |
+
+**Decode: the planner's balanced split is +15-18% over the manual one**
+(40.8 vs 34.5 tok/s same evening) - whole layers on the x1 cards plus a shorter
+Main stage pay exactly as the stage-time rule predicts, links still idle.
+
+**The prefill cliff is real, reproducible and quantified**: above 11 total
+whole layers on x1 dividers, long-prompt prefill re-streams about 1 GiB per
+divider layer per 8192-chunk over the x1 link although the stage reports 100%
+resident (`4096 of its 4096 profiled pairs`, `R4 hit path ON`). `nvidia-smi
+dmon` during a 16K prompt: GPU1 rx **404 MB/s sustained** (the x1 link, fully
+saturated) while GPU3 idles; the same prompt at 11 divider layers moves ~0.
+Byte math matches (+10..25 s per layer past 11 at ~0.4 GB/s). With layer-major
+forced on (Main later-reserve 1229->3277 MiB fits the super-chunk): Main's
+segment hits 1046 tok/s (64 GB read once per prompt) but the divider stages
+STILL stream 761/1137 blobs (39 s on the 3090's x1) - not a chunk-major-only
+re-stream. Candidate upstream report: `[Engine] fully resident split stages
+re-stream expert blobs during long-prompt prefill` (passed: decode 40.8 with
+full residency; failed: prefill 142 at 15 x1 layers; not run: other models,
+quants, engines - never tested here).
+
+Planner response (measured rule, not a guess): `X1_RESIDENT_LAYERS_SAFE = 11`
+warns above 11 total x1 layers; `max_x1_layers=` caps the balance for
+prefill-heavy fleets; decode-first fleets keep the balanced split and the
+warning. Reserve tension measured: 3277 MiB Main later-reserve buys
+layer-major prefill and costs cache slots (3332->2847) and decode
+(40.8->36.8 tok/s).
+
+`--kv-resident 0` (same 11-layer config): prefill 633.9 (unchanged - the cliff
+is expert traffic, not KV), decode 31.8 (-6%): fleet keeps `--kv-resident` at
+or above the wanted context; 0 is workable, not free.
+
+"another GPU" audit (resolved, static): the phrase names the OPT-IN peer
+expert tier (`src/core/peer_experts.hpp`, `peer_device = -1` default - never
+enabled by any config here); no card-to-card expert read happens in these runs.
+The PCIe half is real and is the cliff's channel: `cudaHostGetDevicePointer`
+device aliases of the pinned arena (expert_source.cpp:6135+, "#588") let a GPU
+read host experts by DMA itself - what the divider stages do during prefill.
+
 ## 12. Milestones
 
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.
