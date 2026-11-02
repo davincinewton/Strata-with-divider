@@ -6005,13 +6005,23 @@ int main(int argc, char** argv) {
         const char* v = std::getenv("STRATA_SPLIT_OWN_PLACE");
         return v != nullptr && std::string(v) == "reserve";
     }();
+    // M5-P1 (DIVIDER-PLAN 11.9): a fully-resident x1 divider must never pay the prompt path's buffers and
+    // streamed ring out of its EXPERTS - measured, the re-stream that forces halves prefill (the prompt ring is
+    // the machinery of the stage whose cache streams: only that stage - the drafter's, Main - charges it).
+    // Off by default: byte-identical unless asked.
+    static const bool pf_main_only = [] {
+        const char* v = std::getenv("STRATA_PROMPT_COST_MAIN");
+        return v != nullptr && v[0] == '1';
+    }();
     auto stage_room = [&](int dev, bool later, bool drafter, bool search = false) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
-        const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
+        const int64_t pf = (search && split_own_auto && !place_with_reserve)
+                               ? 0
+                               : (pf_main_only && multi_gpu && !drafter) ? 0 : split_pf_mib;
         // what a later stage allocates after its cache and nothing prices (cuBLAS, the modules and the MMQ pool the prompt path warms up, ~250 MiB measured): the single card prices
         // it (kLateAllocMib, #4474); a stage did not, and two 16 GB cards ended a start with 131 MiB free and ran out of memory in the first long prompt.  Not under STRATA_DEFAULTS=026.
         const int64_t late_alloc = later && !strata::qwen_defaults_026() ? strata::program::split_walk::kStageLateAllocMib : 0;
@@ -6195,6 +6205,18 @@ int main(int argc, char** argv) {
             return m;
         };
         const double tie_eps = 1e-6;
+        // M5-P2 (DIVIDER-PLAN 11.9): pp first, decode advisory.  In this mode the search treats the divider
+        // promise - every non-Main stage holds its layers' FULL profiled pairs, so no dynamic host traffic can
+        // ever happen during a prompt - as a HARD constraint, minimizes the slowest stage's time (= max of
+        // Main's per-chunk compute and the chunk-arrival interval: a starved x1 stage is the only way Main
+        // starves), and a tie prefers fewer layers on Main (its prompt-byte term rides on top of compute).
+        // The decode window's time is still computed and printed, never a veto.  Off by default
+        // (byte-identical).  The four-way branch scores its placements inline and is not retargeted here.
+        bool split_pp = [] { const char* v = std::getenv("STRATA_SPLIT_PP"); return v != nullptr && v[0] == '1'; }();
+        std::vector<int64_t> pairs_L((size_t) g.n_layers, 0);
+        if (split_pp)
+            for (size_t r = 0; r < profile.size(); ++r)
+                if (profile[r].first >= 0 && profile[r].first < g.n_layers) ++pairs_L[(size_t) profile[r].first];
         // ---- LAYER SPLIT STARTABILITY GATE (LAYER 1).  The search must not price placements only by decode time:
         // a split is usable only if the prompt path can start, which requires (serve, `fits_one` 5625-5636 + own_fits
         // 5855-5869): every participant must lend a chunk, or else afford its own prompt buffers with the serve-time
@@ -6328,6 +6350,23 @@ int main(int argc, char** argv) {
             ++tried;
             if (ns <= 3) priced.emplace_back(ms, at);
             const double mx = stage_max(at);
+            if (split_pp) {
+                // every non-Main stage must hold its range's whole profiled pair set (the fill `predict` ran
+                // says what fits; anything short would re-stream over that stage's link during a prompt)
+                for (int i = 0; i + 1 < ns; ++i) {
+                    const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                    int64_t want = 0;
+                    for (int64_t l = lb; l < le; ++l) want += pairs_L[(size_t) l];
+                    if (held_cnt[(size_t) i] < want) return;
+                }
+                const int64_t main_l = g.n_layers - at[(size_t) ns - 2];
+                const int64_t best_main = best.empty() ? g.n_layers + 1 : g.n_layers - best[(size_t) ns - 2];
+                if (mx < best_max - tie_eps || (mx <= best_max + tie_eps && main_l < best_main)) {
+                    if (gate_on && !can_start(parts_of(at))) return;
+                    best = at; best_ms = ms; best_mass = hm; best_held = held; best_max = mx;
+                }
+                return;
+            }
             if (ms < best_ms - tie_eps || (ms <= best_ms + tie_eps && mx < best_max - tie_eps)) {
                 // feasibility gate: mirrors the serve path (`fits_one` + own_fits) for the 512-token last resort;
                 // a placement the prompt path cannot start is not chosen (#1094) - unless nothing can start, below
@@ -6512,6 +6551,16 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        if (split_pp && best.empty()) {
+            // pp-first found no placement that keeps every divider whole at this context: say so and let the
+            // decode-balanced objective decide (the boot-time verification below then warns which card breaks
+            // the promise, and the owner shrinks the context or the layers - the solver never hides it).
+            std::fprintf(stderr, "strata generate: layer split auto: pp-first finds no placement keeping every divider "
+                                 "whole at this context - the decode-balanced search decides instead\n");
+            split_pp = false;
+            best_ms = 1e30; best_max = 1e30; best_mass = 0; best_held = 0;
+            search();
+        }
         // ---- no startable placement: fall back to proportional, and if that too is impossible, say what is short
         auto split_diagnosis = [&](const std::vector<int64_t>& at) {
             const int64_t c = 512;
@@ -6573,6 +6622,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
                              "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass), best of %lld placements\n",
                      ks.c_str(), best_ms, (long long) best_held, profile.size(), 100.0 * best_mass, (long long) tried);
+        if (split_pp)
+            std::fprintf(stderr, "strata generate: layer split auto: pp-first - every divider stage holds its layers' full "
+                                 "pair set at this context (no re-stream during prompts); decode window %.1f ms is advisory\n",
+                         best_ms);
         // #1428: a near tie on a mixed pair.  The model prices a decode window only (the prompt path is not in it), and on
         // cards of different speed or link the winner can flip within a few percent of error: say which other split is
         // almost as good, so the user can try it.  Recommend, never force: this only prints.
@@ -8614,6 +8667,21 @@ int main(int argc, char** argv) {
                              "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
                      (long long) filled, st.profile.size());
+        {
+            // M5 (DIVIDER-PLAN 11.9): the fleet envs declare the divider promise; an explicit --layer-split that
+            // overrides the solver is still VERIFIED against it: a non-Main stage that cannot hold its layers'
+            // pairs re-streams over its link during every prompt (measured: half the prefill per shaved GB).
+            const char* ppv = std::getenv("STRATA_SPLIT_PP");
+            const char* pmv = std::getenv("STRATA_PROMPT_COST_MAIN");
+            const bool fleet = (ppv != nullptr && ppv[0] == '1') || (pmv != nullptr && pmv[0] == '1');
+            const bool last_stage = &st == &*stages.back();
+            if (fleet && !last_stage && filled + 8 < (int64_t) st.profile.size())
+                std::fprintf(stderr, "strata generate: layer split: WARNING CUDA%d holds only %lld of its %zu profiled "
+                                     "pairs - it re-streams %lld pairs over its link during prompts; as a divider it "
+                                     "must hold them all (fewer layers here, or a smaller --max-context)\n",
+                             st.dev, (long long) filled, st.profile.size(),
+                             (long long) ((int64_t) st.profile.size() - filled));
+        }
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));

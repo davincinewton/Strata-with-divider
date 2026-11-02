@@ -355,8 +355,14 @@ def divider_cards(mirror: dict, roles: dict, cards: list, base: dict | None) -> 
         return out
     out["gpu"] = dp["order"]
     out["gpu_order"] = "as_given"
-    out["layer_split"] = dp["layer_split"]
-    out["env_add"] = {"STRATA_STAGE_TRIM": "1", "STRATA_SPLIT_RELEASE": "1"}
+    # M5 (DIVIDER-PLAN 11.9): the cut points default to "auto" - the ENGINE's pp-first capacity solver
+    # (STRATA_SPLIT_PP) decides them from the model, the cards and --max-context, with the divider promise
+    # (full pair residency at every context) as a hard constraint.  The control plane's own estimate stays
+    # in divider_plan as advice; a number the user gave flows through untouched (the engine then only
+    # verifies the promise and warns when it breaks).
+    out["layer_split"] = "auto"
+    out["env_add"] = {"STRATA_STAGE_TRIM": "1", "STRATA_SPLIT_RELEASE": "1",
+                      "STRATA_PROMPT_COST_MAIN": "1", "STRATA_SPLIT_PP": "1"}
     out["divider_plan"] = dp["plan_text"]
     return out
 
