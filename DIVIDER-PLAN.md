@@ -111,22 +111,27 @@ complement logic still applies to whatever RAM copy exists (ideally none).
 - Additive + opt-in only; defaults byte-identical.
 - v1 = Terminal/run-configs; app UI deferred. Linux only.
 
-## 5. Phase 0A — SSD-truth on THIS rig, zero code (do first)
+## 5. Phase 0A — SSD-truth experiments, RESULT 2026-11-02 (single card, Q6_K_XL)
 
-Same single card, the Q6_K_XL model, existing config minus the RAM assumption:
+Same-day runs (driver at /tmp, configs `strata-unsloth-ud-q6_k_xl-m0a-r{1..4}.json`,
+port 8081; r4 NOT run — deterministically refused for the same disk reason as r2):
 
-- Try the existing knobs, one variable at a time, same-day runs:
-  1. baseline as-is (RAM/spill behavior — record RSS + tok/s)
-  2. `STRATA_ARENA_MMAP=1` (if the native pack path accepts it — O1)
-  3. `--resident-experts` ± `--resident-budget-gib` (complement shrink)
-  4. combinations; capture `cache complement ready: resident X GiB, pinned Y`
-     and the "read from the file when lent" shares.
-- Measure: RSS high-water, decode tok/s vs baseline, prefill at 87K prompts
-  (the log has ready-made 87–93K prompt cases!), SSD read MB/s (`iostat`),
-  page-cache behavior (`free`, drop caches A/B).
-- **Exit:** a config where RSS is buffers-only (no full arena), decode ≥ 90% of
-  baseline, SSD stream inside budget. This is the base method working — fleet
-  Phase 0B assumes it.
+| run | config | decode | host RAM after load | notes |
+|---|---|---|---|---|
+| r1 | baseline (RAM-truth) | **32.9 tok/s** | RSS 111.1 GB (anon 108 GB), avail 13 G | = the missing **same-day single-card Q6 baseline** |
+| r2 | + `STRATA_ARENA_MMAP=1` | 34.3 (noise band) | unchanged | **O1 RESOLVED**: mmap bootstraps — first start WRITES `experts.bin` next to the GGUF shards (needs size+2 GiB free), later starts MAP it (file-backed, page-cache fuzzy tier = the true SSD-truth design). REFUSED here: 28.6 GiB free on the shard drive, needs 103.8 (R8 real) → ran as r1 |
+| r3 | + `--resident-experts` | **25.1 tok/s (−24%)** | "used" 6 G + 118 G cache — but complement is 91.9 GiB **page-locked** (mapped pinned); avail only 13→22 G | resident mode is NOT SSD-truth; it trades anon RAM for locked file-mapped RAM and costs a quarter of decode on this rig; 0 file blob reads |
+
+**Conclusions.** (1) Full SSD-truth is disk-gated on this rig: needs a ~104 GiB
+free drive co-located with the shards; mechanism itself is confirmed to exist
+and self-diagnose (expert_source.cpp:6108-6132). (2) On this machine the base
+method stays RAM-truth; planner treats SSD-truth as a conditional it enables
+only when `free(next to shard) ≥ experts + blob + 2 GiB`. (3) `--resident-experts`
+stays OFF by default on this hardware (−24%); revisit only when a model
+exceeds RAM + cache, where it is the alternative to spilling. (4) The
+planner's miss-stream budget inputs from here: single-card Q6 hit path 3250
+resident experts, adaptive tier active.
+M0B's 34.6–35.6 tok/s is now +5.7% vs this same-day single-card baseline.
 
 ## 6. Phase 0B — divider physics on a fleet rig (needs hardware)
 
