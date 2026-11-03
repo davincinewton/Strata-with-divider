@@ -3095,6 +3095,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot[(size_t) tap_layers_[i]] = (int) i;
     }
 #endif
+    // STRATA_TRACE=1: per-chunk accounting per stage of a split (off by default).  The enter line above existed;
+    // the done lines below add the two numbers a stall search needs: what a chunk cost THIS stage and how many
+    // experts it streamed.  The stages run on their own threads; each prints its own lines, timestamps are
+    // relative to the prompt's first chunk entering the first stage.
+    static const bool trace_chunk = std::getenv("STRATA_TRACE") != nullptr;
+    Clock::time_point tc0{};
+    int64_t t_stream0 = 0;
     for (int64_t c0 = 0; c0 < n; c0 += C) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
@@ -3111,6 +3118,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld stage [%lld,%lld) %.1f ms\n", (long long) c0,
                          (long long) n, (long long) stage_lb_, (long long) stage_le_, ms);
             std::fflush(stderr);
+            tc0 = Clock::now();
+            t_stream0 = stats_.experts_streamed;
         }
         const int64_t T = std::min(C, n - c0), p0 = pos0 + c0;
         // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
@@ -5680,6 +5689,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 strata::aux_cpus::pin_current_thread();
                 return next_->run_impl(tokens + c0, T, p0, next_err_);
             });
+            if (trace_chunk) {
+                std::fprintf(stderr, "strata trace: stage [%lld,%lld) chunk at %lld (%lld tokens) took %.1f ms, "
+                                     "%lld experts streamed; handed on\n",
+                             (long long) stage_lb_, (long long) stage_le_, (long long) p0, (long long) T,
+                             std::chrono::duration<double, std::milli>(Clock::now() - tc0).count(),
+                             (long long) (stats_.experts_streamed - t_stream0));
+                std::fflush(stderr);
+            }
             hand_buf_ ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
@@ -5735,6 +5752,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
+        }
+        if (trace_chunk) {
+            std::fprintf(stderr, "strata trace: stage [%lld,%lld) chunk at %lld (%lld tokens) took %.1f ms, "
+                                 "%lld experts streamed; done\n",
+                         (long long) stage_lb_, (long long) stage_le_, (long long) p0, (long long) T,
+                         std::chrono::duration<double, std::milli>(Clock::now() - tc0).count(),
+                         (long long) (stats_.experts_streamed - t_stream0));
+            std::fflush(stderr);
         }
     }
     // Do not drain the successor here. This is the overlap: an intermediate
