@@ -6074,8 +6074,13 @@ int main(int argc, char** argv) {
         auto stage_left = [&](int i, int64_t lb, int64_t le) -> int64_t {
             // CUDA0 holds its FULL dense table while the search runs; STAGE_TRIM frees everything beyond its
             // range at serve time.  Count that room now, or a small first card looks empty forever.
+            // M5-P3 fix: the credit for CUDA0's trimmed weights must be its MEASURED pool scaled to the
+            // share the range releases - the priced carve claimed 5.5 GiB of releasable weights on a card
+            // whose whole pool is 1.4 GiB (boot measured: CUDA0 planned 2 layers, held 517/1024, aborted).
             const int64_t trim_credit =
-                (i == 0 && multi_gpu && trim_asked) ? (int64_t) carve_bytes(le, g.n_layers) : 0;
+                (i == 0 && multi_gpu && trim_asked)
+                    ? (int64_t)((double)pool_bytes * (double)(g.n_layers - le) / (double)g.n_layers)
+                    : 0;
             return cap[(size_t) i] + trim_credit - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) -
                    (i == 0 ? 0 : (int64_t) carve_bytes(lb, le));
         };
@@ -6697,7 +6702,9 @@ int main(int argc, char** argv) {
                 const int64_t le = std::min(n, g.n_layers);
                 const int64_t pf_delta_mib = split_pf_mib > 0 ? (chunk - chunk_now) * 680 / 1024 : 0;
                 const int64_t trim_credit =
-                    (i == 0 && trim_asked) ? (int64_t) carve_bytes(le, g.n_layers) : 0;
+                    (i == 0 && trim_asked)
+                        ? (int64_t)((double)pool_bytes * (double)(g.n_layers - le) / (double)g.n_layers)
+                        : 0;
                 return cap[(size_t) i] + trim_credit - pf_delta_mib * 1048576 -
                        (int64_t) strata::core::session_bytes(g, ctx, K, 0, le) - (i == 0 ? 0 : (int64_t) carve_bytes(0, le));
             };

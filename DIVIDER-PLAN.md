@@ -573,6 +573,15 @@ MiB short) refused to serve with the measured budget lines as evidence; plans no
 MiB + 0.2 GiB/layer slack over the dense under-pricing.  CUDA1-5 then measured `holds 1024 of
 1024` - the promise tier itself is flawless.
 
+The CUDA0 abort then fired on the owner's own 4096 run - and exposed the last planner lie: the
+first card's trim credit was PRICED (carve_bytes said 5.5 GiB of releasable weights) while the card's
+whole weight pool measured 1.4 GiB (`pool_bytes`, logged at every boot).  The credit is now the
+measured pool scaled by the range share, everywhere the planner counts CUDA0 (predict runs through
+the same stage_left, so residency, scoring, greedy and the refusal ledger all agree).  Expected plan
+at 262 K@4096: CUDA0 one whole layer (its honest room 2.76 + 1.37 - 0.2 GiB session covers 512 slots
+of ~4.3 MiB), CUDA1-5 two each, Main 37 - every card `holds all`, the boot either serves compliant
+or names the card that cannot.
+
 Two holes the compliant 195.6-tok/s boot exposed, measured: (a) **CUDA0's own cache was never
 verified** - it held 517 of 1024 while the stages' loop checked everyone else (same abort now
 added for CUDA0); (b) **Main's chunk stepped down 4096 -> 1536 -> 237** at serve: its cache sizing
