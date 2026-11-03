@@ -1487,6 +1487,7 @@ void drive_pool_split_invariant(void* u, const float* x, const int32_t* ids, int
 struct GpuStage {
     int dev = 0;
     int64_t lb = 0, le = 0;
+    uint64_t dense_taken = 0;   // M5 budget print: what this stage's dense load really cost in VRAM (0 = not late-loaded)
     double pcie_frac = 0.0;
     double link_gbps = 0.0;   ///< this card's probed host->device bandwidth (PcieAuto's per-stage share)
     strata::core::WeightTable wt;
@@ -5944,13 +5945,13 @@ int main(int argc, char** argv) {
     // rig: 130 tok/s at 512-token chunks vs 668-674 at 8192, same split, same tier).  A --prefill the user
     // typed always wins; if 8192 cannot be funded the buffer ladder steps it down as it always has.  Every
     // other configuration keeps today's behavior exactly.
+    static const bool pp_fleet_mode = [] {
+        const char* a = std::getenv("STRATA_SPLIT_PP");
+        const char* b = std::getenv("STRATA_PROMPT_COST_MAIN");
+        return (a != nullptr && a[0] == '1') || (b != nullptr && b[0] == '1');
+    }();
     {
-        static const bool pp_fleet = [] {
-            const char* a = std::getenv("STRATA_SPLIT_PP");
-            const char* b = std::getenv("STRATA_PROMPT_COST_MAIN");
-            return (a != nullptr && a[0] == '1') || (b != nullptr && b[0] == '1');
-        }();
-        if (pp_fleet && multi_gpu && (o.prefill_auto || o.prefill_chunk <= 0)) {
+        if (pp_fleet_mode && multi_gpu && (o.prefill_auto || o.prefill_chunk <= 0)) {
             o.prefill_auto = false;
             o.prefill_chunk = 8192;
             std::fprintf(stderr, "strata generate: the divider fleet defaults the prompt chunk to 8192 tokens "
@@ -6071,7 +6072,11 @@ int main(int argc, char** argv) {
         std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
         // what stage i has left for experts if it runs [lb, le): its room, minus its session and (a later stage) its weights
         auto stage_left = [&](int i, int64_t lb, int64_t le) -> int64_t {
-            return cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) -
+            // CUDA0 holds its FULL dense table while the search runs; STAGE_TRIM frees everything beyond its
+            // range at serve time.  Count that room now, or a small first card looks empty forever.
+            const int64_t trim_credit =
+                (i == 0 && multi_gpu && trim_asked) ? (int64_t) carve_bytes(le, g.n_layers) : 0;
+            return cap[(size_t) i] + trim_credit - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) -
                    (i == 0 ? 0 : (int64_t) carve_bytes(lb, le));
         };
         std::vector<double> layer_ms((size_t) ns);
@@ -6555,7 +6560,8 @@ int main(int argc, char** argv) {
         // prompt chunk of every card is clamped to what the smallest cache can lend.  When the pick has such a
         // stage, look again among placements that give every stage at least kMinStageLayers layers; keep the new
         // pick if there is one, and say so.  Recommend, never force: with none startable the first pick stays.
-        if (!best.empty() && strata::program::split_rules::restriction_possible(g.n_layers, ns) &&
+        if (!best.empty() && !pp_fleet_mode &&
+            strata::program::split_rules::restriction_possible(g.n_layers, ns) &&
             strata::program::split_rules::has_tiny_stage(best, g.n_layers)) {
             const std::vector<int64_t> first = best;
             const double first_ms = best_ms;
@@ -6612,15 +6618,159 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // M5-P3: stage counts beyond the enumeration's reach (five or more).  A pp placement there is capacity
+        // arithmetic, not a search: every divider that can hold its layers' WHOLE pair set takes them, Main takes
+        // the rest, and the max-time shaving keeps one slow divider from becoming the chain's beat.  consider()
+        // still verifies the real ranges, prices the sweep, and is the only thing that can commit the split.
+        if (split_pp && best.empty() && ns >= 5) {
+            std::vector<int64_t> Lcap((size_t) ns, 0);
+            for (int i = 0; i + 1 < ns; ++i) {
+                double cum = 0;
+                int64_t n = 0;
+                while (n + 1 < g.n_layers - (ns - 2)) {
+                    cum += (double) pairs_L[(size_t) n] * (double) cost(n);
+                    // slack: 3% + 256 MiB + 0.2 GiB per layer (slot guards, allocator granularity, and the
+                    // dense carve under-pricing this model measures at ~0.19 GiB/layer - "priced 580 took
+                    // 1418"; the pricing fix is plan backlog, the slack is what keeps plans honest today)
+                    if (cum * 1.03 + 268435456.0 + 209715200.0 * (double) (n + 1) >
+                        (double) stage_left(i, 0, n + 1)) break;
+                    ++n;
+                }
+                Lcap[(size_t) i] = n;
+            }
+            for (int shape = 0; shape < 2 && best.empty(); ++shape) {   // 0: max offload, 1: each divider one layer
+                std::vector<int64_t> Lv((size_t) ns, 1);
+                if (shape == 0)
+                    for (int i = 0; i + 1 < ns; ++i) Lv[(size_t) i] = Lcap[(size_t) i];
+                for (int it = 0; it < 128; ++it) {
+                    int64_t used = 0;
+                    for (int i = 0; i + 1 < ns; ++i) used += Lv[(size_t) i];
+                    if (used >= g.n_layers) {   // over-allocated: shave the largest divider
+                        size_t big = 0;
+                        for (int i = 1; i + 1 < ns; ++i)
+                            if (Lv[(size_t) i] > Lv[big]) big = (size_t) i;
+                        if (Lv[big] <= 1) break;
+                        --Lv[big];
+                        continue;
+                    }
+                    const double main_ms = (double) (g.n_layers - used) * layer_ms[(size_t) ns - 1];
+                    int worst = -1;
+                    double worst_ms = main_ms;
+                    for (int i = 0; i + 1 < ns; ++i) {
+                        const double d = (double) Lv[(size_t) i] * layer_ms[(size_t) i];
+                        if (d > worst_ms + tie_eps) { worst_ms = d; worst = i; }
+                    }
+                    if (worst < 0 || Lv[(size_t) worst] <= 1) break;
+                    --Lv[(size_t) worst];
+                }
+                int64_t used = 0, c = 0;
+                bool ok = true;
+                for (int i = 0; i + 1 < ns; ++i) {
+                    if (Lv[(size_t) i] < 1) { ok = false; break; }
+                    used += Lv[(size_t) i];
+                    c += Lv[(size_t) i];
+                    if (c >= g.n_layers) { ok = false; break; }
+                    (void) used;
+                }
+                if (!ok || c >= g.n_layers) continue;
+                int64_t p = 0;
+                at.assign((size_t) ns - 1, 0);
+                for (int i = 0; i + 1 < ns; ++i) {
+                    p += Lv[(size_t) i];
+                    at[(size_t) i] = p;
+                }
+                consider();
+            }
+            if (!best.empty())
+                std::fprintf(stderr, "strata generate: layer split auto: pp capacity-greedy placed %d stages "
+                                     "(the enumeration stops at four); the verification below holds it to the promise\n", ns);
+        }
         if (split_pp && best.empty()) {
-            // pp-first found no placement that keeps every divider whole at this context: say so and let the
-            // decode-balanced objective decide (the boot-time verification below then warns which card breaks
-            // the promise, and the owner shrinks the context or the layers - the solver never hides it).
-            std::fprintf(stderr, "strata generate: layer split auto: pp-first finds no placement keeping every divider "
-                                 "whole at this context - the decode-balanced search decides instead\n");
-            split_pp = false;
-            best_ms = 1e30; best_max = 1e30; best_mass = 0; best_held = 0;
-            search();
+            // M5-P3 (the owner's rule): the minimum stage is already ONE whole layer, so nothing found means the
+            // arithmetic limit was reached.  A pp fleet does not serve a broken promise: print the per-card ledger,
+            // ask consent for a safe context, hint the chunk lever, and stop.  STRATA_SPLIT_PP=0 stays the explicit
+            // opt-out into the old decode-balanced fallback (the verification warnings then mark the broken stages).
+            const int64_t chunk_now = o.prefill_chunk > 0 ? o.prefill_chunk : 8192;
+            const double pair_layer = (double) g.n_expert * (double) cost(0);   // a layer's whole pair set, bytes
+            // a stage's room for its first n layers at (ctx, chunk): cap minus the staging delta, session, weights
+            auto room_layers = [&](int i, int64_t n, int64_t ctx, int64_t chunk) -> int64_t {
+                const int64_t le = std::min(n, g.n_layers);
+                const int64_t pf_delta_mib = split_pf_mib > 0 ? (chunk - chunk_now) * 680 / 1024 : 0;
+                const int64_t trim_credit =
+                    (i == 0 && trim_asked) ? (int64_t) carve_bytes(le, g.n_layers) : 0;
+                return cap[(size_t) i] + trim_credit - pf_delta_mib * 1048576 -
+                       (int64_t) strata::core::session_bytes(g, ctx, K, 0, le) - (i == 0 ? 0 : (int64_t) carve_bytes(0, le));
+            };
+            // WHOLE layers a divider fits at (ctx, chunk); Main fits layers without residency but must keep 512 MiB
+            // of expert cache (a Main with no cache starves the pipeline whatever the promise says)
+            auto whole_layers = [&](int i, int64_t ctx, int64_t chunk) -> int64_t {
+                const bool drafter = i + 1 == ns;
+                int64_t n = 0;
+                while (n < g.n_layers) {
+                    const double need = drafter ? (double) (512ll << 20) : pair_layer * (double) (n + 1);
+                    if ((double) room_layers(i, n + 1, ctx, chunk) < need) break;
+                    ++n;
+                }
+                return n;
+            };
+            auto feasible = [&](int64_t ctx, int64_t chunk) {
+                int64_t total = 0;
+                for (int i = 0; i + 1 < ns; ++i) {
+                    if (whole_layers(i, ctx, chunk) < 1) return false;
+                    total += whole_layers(i, ctx, chunk);
+                }
+                return total + whole_layers(ns - 1, ctx, chunk) >= g.n_layers;
+            };
+            std::fprintf(stderr, "strata generate: layer split auto: THE PROMISE IMPOSSIBLE - no placement keeps every "
+                                 "divider whole at context %lld with %lld-token chunks, not even one whole layer per "
+                                 "divider.  Nothing is served.  Ledger at this context:\n",
+                         (long long) o.max_context, (long long) chunk_now);
+            for (int i = 0; i < ns; ++i) {
+                const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
+                const bool drafter = i + 1 == ns;
+                const double kv1 = ((double) strata::core::session_bytes(g, o.max_context, K, 0, 1) -
+                                    (double) strata::core::session_bytes(g, o.max_context, K, 0, 0)) / 1073741824.0;
+                const double d1 = (double) carve_bytes(0, 1) / 1073741824.0;
+                const long long wh = (long long) whole_layers(i, o.max_context, chunk_now);
+                if (drafter)
+                    std::fprintf(stderr, "strata generate:   CUDA%d: Main: a layer costs %.2f GiB KV + %.2f dense, "
+                                         "experts streamed, cache must keep >= 512 MiB; fits %lld layer(s)\n",
+                                 dev, kv1, d1, wh);
+                else
+                    std::fprintf(stderr, "strata generate:   CUDA%d: divider: a whole layer costs %.2f experts + %.2f "
+                                         "KV + %.2f dense GiB; fits %lld layer(s)\n",
+                                 dev, pair_layer / 1073741824.0, kv1, d1, wh);
+            }
+            static const int64_t ctx_steps[] = {262144, 196608, 131072, 98304, 65536, 49152, 32768, 24576, 16384, 8192};
+            int64_t safe_ctx = 0;
+            for (const int64_t c : ctx_steps)
+                if (c < o.max_context && feasible(c, chunk_now)) { safe_ctx = c; break; }
+            if (safe_ctx > 0)
+                std::fprintf(stderr, "strata generate:   option 1 (consent = restart with it): reduce the context. The "
+                                     "largest standard context every card can keep the promise at is %lld - KV scales "
+                                     "with context, the promise does not.  Restart with --max-context %lld "
+                                     "(config: add \"--max-context\", \"%lld\" to args, replacing the old value).\n",
+                             (long long) safe_ctx, (long long) safe_ctx, (long long) safe_ctx);
+            else
+                std::fprintf(stderr, "strata generate:   option 1: no standard context fits these cards as whole-pair "
+                                     "dividers at this chunk - the cards are too small for the promise itself.\n");
+            int64_t rec_chunk = 0;
+            for (const int64_t c : {4096, 2048, 1024, 512})
+                if (c < chunk_now && feasible(o.max_context, c)) { rec_chunk = c; break; }
+            if (rec_chunk > 0)
+                std::fprintf(stderr, "strata generate:   option 2 (a hint - nothing was changed): a smaller prompt chunk "
+                                     "frees each card's staging buffers (160 + chunk x 0.66 MiB): --prefill %lld makes "
+                                     "the promise fit at context %lld.  Add (\"--prefill\", \"%lld\") to the config "
+                                     "args.  Cost: every boundary re-sweeps Main's streamed experts (this rig measured "
+                                     "130 tok/s at 512 vs 668-674 at 8192) - bigger chunks are always pp-preferred.\n",
+                             (long long) rec_chunk, (long long) o.max_context, (long long) rec_chunk);
+            else
+                std::fprintf(stderr, "strata generate:   option 2: even 512-token chunks cannot make the promise fit at "
+                                     "context %lld - the context, not the chunk, is what binds on this rig.\n",
+                             (long long) o.max_context);
+            std::fprintf(stderr, "strata generate:   (to serve without the promise anyway - dividers re-stream over "
+                                 "their links, slow - set STRATA_SPLIT_PP=0 and restart)\n");
+            return 1;
         }
         // ---- no startable placement: fall back to proportional, and if that too is impossible, say what is short
         auto split_diagnosis = [&](const std::vector<int64_t>& at) {
@@ -6689,6 +6839,42 @@ int main(int argc, char** argv) {
                                  "(compute + %.2f GiB streamed sweep per %lld-token chunk at its link); decode window "
                                  "%.1f ms is advisory\n",
                          pp_main_ms, pp_sweep_gib, (long long) o.prefill_chunk, best_ms);
+        // M5 budget print (the user's rule: the allocation and its weight-space math are shown, not assumed).
+        // The chosen split's per-card ledger in the search's own numbers: what the card had, what its layers
+        // cost (dense carve, KV+state at this context; prompt staging and reserve inside the rest term), what
+        // was left for experts, what its layers' pairs need, and whether the room covers them.  Printed in
+        // fleet mode whether or not the promise held - the SHORT lines are what explains a broken fleet.
+        {
+            static const bool pp_fleet_print = [] {
+                const char* a = std::getenv("STRATA_SPLIT_PP");
+                const char* b = std::getenv("STRATA_PROMPT_COST_MAIN");
+                return (a != nullptr && a[0] == '1') || (b != nullptr && b[0] == '1');
+            }();
+            if (pp_fleet_print && !best.empty()) {
+                for (int i = 0; i < ns; ++i) {
+                    const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
+                    const int64_t lb = i == 0 ? 0 : best[(size_t) i - 1], le = i + 1 < ns ? best[(size_t) i] : g.n_layers;
+                    const int64_t room = stage_room(dev, i > 0, i == ns - 1, true);
+                    const int64_t kv = (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le);
+                    const int64_t dense = (int64_t) carve_bytes(lb, le);
+                    int64_t pairs = 0;
+                    double need = 0;
+                    for (int64_t l = lb; l < le; ++l) {
+                        pairs += pairs_L[(size_t) l];
+                        need += (double) pairs_L[(size_t) l] * (double) cost(l);
+                    }
+                    std::fprintf(stderr, "strata generate: layer split budget, CUDA%d: layers %lld-%lld; free %.2f GiB = "
+                                         "dense %.2f + KV+state %.2f + rest %.2f + room %.2f; its %lld pairs need %.2f "
+                                         "GiB -> %s\n",
+                                 dev, (long long) lb, (long long) (le - 1), (double) cap[(size_t) i] / 1073741824.0,
+                                 (double) dense / 1073741824.0, (double) kv / 1073741824.0,
+                                 std::max(0.0, (double) cap[(size_t) i] / 1073741824.0 - (double) dense / 1073741824.0 -
+                                                  (double) kv / 1073741824.0 - (double) room / 1073741824.0),
+                                 (double) room / 1073741824.0, (long long) pairs, need / 1073741824.0,
+                                 need <= (double) room ? "WHOLE" : "SHORT - promise impossible on this card at this context");
+                }
+            }
+        }
         // #1428: a near tie on a mixed pair.  The model prices a decode window only (the prompt path is not in it), and on
         // cards of different speed or link the winner can flip within a few percent of error: say which other split is
         // almost as good, so the user can try it.  Recommend, never force: this only prints.
@@ -6770,6 +6956,7 @@ int main(int argc, char** argv) {
                 // under-pricing is what put layers on a card that could not hold them (#1238); a little over-pricing is
                 // by design (a granule per matrix runs ~0.8% high).  Past 5% the pricing has drifted from the loading.
                 const uint64_t took = before > fb ? (uint64_t) (before - fb) : 0;
+                st.dense_taken = took;   // M5 budget print: the measured dense share of this card
                 const uint64_t priced = carve_bytes(st.lb, st.le);
                 if (priced < took || priced - took > took / 20)
                     std::fprintf(stderr, "strata generate: layer split, CUDA%d: WARNING the split search priced this "
@@ -8637,17 +8824,18 @@ int main(int argc, char** argv) {
                              herr.empty() ? "type or build not movable" : herr.c_str());
             }
         }
+        size_t fb = 0, tb = 0;
         {
-            size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB\n",
                          st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0);
         }
         std::vector<int64_t> sized;
-        int64_t used = 0;
+        int64_t used = 0, want = 0;
         for (const auto& pr : st.profile) {
             const int64_t b = native_pack ? strata::core::ExpertCache::slot_stride((int64_t) nib::slot_bytes(pr.first), slot_guard)
                                           : (int64_t) lay.max_blob;
+            want += b;
             if (used + b > room) break;
             used += b;
             sized.push_back((int64_t) nib::slot_bytes(pr.first));
@@ -8730,6 +8918,22 @@ int main(int argc, char** argv) {
                              "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
                      (long long) filled, st.profile.size());
+        // M5 budget print, measured on the card at the moment its cache was sized: the card, its dense share
+        // (measured at load, priced when not late-loaded), its K/V+state at this context, the rest (driver,
+        // vision, prompt buffers, drafter, reserve), the free figure, and the expert ledger: room had, cache
+        // built, and what the stage's whole pair set would need.
+        {
+            const double dense = st.dense_taken ? (double) st.dense_taken : (double) carve_bytes(st.lb, st.le);
+            const double kv = (double) strata::core::session_bytes(g, o.max_context, K, st.lb, st.le);
+            std::fprintf(stderr, "strata generate: layer split budget, CUDA%d (measured): card %.2f GiB = dense %.2f + "
+                                 "KV+state %.2f + rest %.2f + free %.2f; room was %.2f, cache built %.2f (%lld slots); "
+                                 "its %zu pairs would need %.2f GiB -> holds %lld\n",
+                         st.dev, (double) tb / 1073741824.0, dense / 1073741824.0, kv / 1073741824.0,
+                         std::max(0.0, ((double) tb - (double) fb - dense - kv) / 1073741824.0),
+                         (double) fb / 1073741824.0, (double) room / 1073741824.0, st.cache.gib(),
+                         (long long) st.cache.slots(), st.profile.size(), (double) want / 1073741824.0,
+                         (long long) filled);
+        }
         {
             // M5 (DIVIDER-PLAN 11.9): the fleet envs declare the divider promise; an explicit --layer-split that
             // overrides the solver is still VERIFIED against it: a non-Main stage that cannot hold its layers'
@@ -8737,16 +8941,28 @@ int main(int argc, char** argv) {
             const char* ppv = std::getenv("STRATA_SPLIT_PP");
             const char* pmv = std::getenv("STRATA_PROMPT_COST_MAIN");
             const bool fleet = (ppv != nullptr && ppv[0] == '1') || (pmv != nullptr && pmv[0] == '1');
+            const bool pp_promise = ppv != nullptr && ppv[0] == '1';
             const bool last_stage = &st == &*stages.back();
-            if (fleet && !last_stage && filled + 8 < (int64_t) st.profile.size())
+            if (fleet && !last_stage && filled + 8 < (int64_t) st.profile.size()) {
                 std::fprintf(stderr, "strata generate: layer split: WARNING CUDA%d holds only %lld of its %zu profiled "
                                      "pairs - it re-streams %lld pairs over its link during prompts; as a divider it "
                                      "must hold them all (fewer layers here, or a smaller --max-context)\n",
                              st.dev, (long long) filled, st.profile.size(),
                              (long long) ((int64_t) st.profile.size() - filled));
+                if (pp_promise) {
+                    // M5-P3: the search's ledger and this card's real room disagree - the measured line above
+                    // says where the GiB went.  A pp fleet never serves a broken promise: abort, do not stream.
+                    std::fprintf(stderr, "strata generate: layer split: the promise cannot be kept on CUDA%d as "
+                                         "planned - NOTHING SERVED.  The search priced the cards too optimistically; "
+                                         "trust the measured budget lines, not the plan.  Try a smaller --max-context "
+                                         "or fewer layers on this card (--layer-split), or STRATA_SPLIT_PP=0 to serve "
+                                         "without the promise.\n", st.dev);
+                    return 1;
+                }
+            }
         }
     }
-    if (multi_gpu)
+    if (multi_gpu) {
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
     // THE LAYER SPLIT'S SPILL WALK, STEP 4: THE LOAN KEEPS 16.  A stage whose cache is too small to lend the prompt path a 256-token chunk and keep 128 slots behind makes the path
     // allocate its own buffers on top (more than the reserve): the same short card as the single card's, which keeps 16 slots instead (the cache is smaller, prompts are read in
@@ -8764,6 +8980,43 @@ int main(int argc, char** argv) {
                 break;
             }
         }
+        // M5 budget print: Main's ledger too (its dense is loaded in the normal loop, so it is the priced figure).
+        const strata::core::OnDevice on0(primary_device);
+        size_t fb0 = 0, tb0 = 0;
+        cudaMemGetInfo(&fb0, &tb0);
+        const double dense0 = (double) carve_bytes(0, split_at[0]);
+        const double kv0 = (double) strata::core::session_bytes(g, o.max_context, K, 0, split_at[0]);
+        std::fprintf(stderr, "strata generate: layer split budget, CUDA0 (measured card, priced dense): layers 0-%lld; "
+                             "card %.2f GiB = dense %.2f + KV+state %.2f + rest %.2f + free %.2f; expert cache %.2f "
+                             "(%lld slots); its %zu pairs would need %.2f GiB\n",
+                     (long long) (split_at[0] - 1), (double) tb0 / 1073741824.0, dense0 / 1073741824.0,
+                     kv0 / 1073741824.0,
+                     std::max(0.0, ((double) tb0 - (double) fb0 - dense0 - kv0) / 1073741824.0),
+                     (double) fb0 / 1073741824.0, xcache.gib(), (long long) xcache.slots(), profile.size(),
+                     (double) profile.size() * (native_pack ? (double) nib::slot_bytes(profile[0].first)
+                                                            : (double) strata::kernels::cpu::expert_layout().max_blob) /
+                         1073741824.0);        // M5-P3: CUDA0's own cache must satisfy the same promise as every divider's (the stages' loop above
+        // cannot see it - CUDA0's cache is xcache).  A missing pair here re-streams over CUDA0's link from
+        // the head of the chain, and the whole pipeline waits for it.
+        {
+            const char* ppv0 = std::getenv("STRATA_SPLIT_PP");
+            if (ppv0 != nullptr && ppv0[0] == '1') {
+                int64_t held0 = 0;
+                for (const auto& pr : profile)
+                    if (xcache.slot_of(pr.first, pr.second) >= 0) ++held0;
+                if (held0 + 8 < (int64_t) profile.size()) {
+                    std::fprintf(stderr, "strata generate: layer split: WARNING CUDA0 holds only %lld of its %zu "
+                                         "profiled pairs - it re-streams %lld pairs over its link during prompts\n",
+                                 (long long) held0, profile.size(), (long long) ((int64_t) profile.size() - held0));
+                    std::fprintf(stderr, "strata generate: layer split: the promise cannot be kept on CUDA0 as "
+                                         "planned - NOTHING SERVED.  The measured budget line above says where the "
+                                         "GiB went.  Try a smaller --max-context, fewer layers on CUDA0 "
+                                         "(--layer-split), or STRATA_SPLIT_PP=0 to serve without the promise.\n");
+                    return 1;
+                }
+            }
+        }
+
     }
     if (nib::any_on()) {
         // STRATA_EXPERT_NIBBLE: every expert of every layer must be in VRAM, in the cache of the card that runs the layer.
