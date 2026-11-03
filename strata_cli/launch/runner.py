@@ -361,8 +361,18 @@ def divider_cards(mirror: dict, roles: dict, cards: list, base: dict | None) -> 
     # in divider_plan as advice; a number the user gave flows through untouched (the engine then only
     # verifies the promise and warns when it breaks).
     out["layer_split"] = "auto"
-    out["env_add"] = {"STRATA_STAGE_TRIM": "1", "STRATA_SPLIT_RELEASE": "1",
-                      "STRATA_PROMPT_COST_MAIN": "1", "STRATA_SPLIT_PP": "1"}
+    # M5 review (DIVIDER-PLAN 11.10): Main's cache misses stream through the arena file-cache tier, not a
+    # page-locked blob tier - the pinned tier costs ~1 ms per streamed blob (same rig, same split: 662 -> 130
+    # tok/s).  The solver's full pair residency on the dividers IS the no-dynamic-traffic promise; a pinned
+    # tier would be redundant insurance.  Prompt chunks: the engine's "auto" sizes them to whatever the
+    # prompt path can fund - when it must fund its own buffers that can shrink to 512, and a chunk boundary
+    # re-sweeps every layer's streamed experts (bytes per token x16 at 512 vs 8192; measured 130 -> 663).
+    # The fleet opts into 8192-token windows; a user --prefill in the config wins over it.
+    out["env_add"] = {"STRATA_STAGE_TRIM": "1", "STRATA_PROMPT_COST_MAIN": "1",
+                      "STRATA_SPLIT_PP": "1", "STRATA_SPLIT_OWN": "1"}
+    gargs = out.get("args")
+    if isinstance(gargs, list) and "--prefill" not in gargs and "--prefill-pipe" not in gargs:
+        out["args"] = gargs + ["--prefill", "8192"]
     out["divider_plan"] = dp["plan_text"]
     return out
 

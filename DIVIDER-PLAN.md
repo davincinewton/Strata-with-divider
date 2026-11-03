@@ -432,8 +432,93 @@ Validation suite: the solver must predict max-8 on a 2080 Ti divider at
 262 K, infeasibility of 7,13+ring384 with CUDA1 full residency, and `5,11`
 feasible at 131 K; the table above is the ground truth it must reproduce.
 
-## 12. Milestones
+**M5-live (measured, this rig, engine `02b0ff6a`+):** the funding fix and the
+pp-first solver DELIVERED the promise - the boot now picks `K=7,15`, CUDA1 runs
+8 layers with **4096 of 4096** pairs and CUDA0 **3584 of 3584**, and per-prompt
+x1 traffic is 0.5 GB (stage0) / 0.9 GB (stage1) per prompt - hand-offs only,
+zero expert
+bytes (the boot-time verification line is the guard). But pp did not reach
+parity at first, and the two remaining levers turned out to be the prefill
+GEOMETRY and the streaming PIPELINE, not residency:
 
+- **Layer-major serializes the chain.** Its default (on for CUDA splits) fits
+  a super-chunk on every stage here, so chunk c+1 starts on stage0 only after
+  c left Main: total = sum of stages (one 18,633-token super-chunk: 88.9 s
+  cold, 52.9 s warm = 352). The 650-class runs were fast exactly because Main
+  had no VRAM for a super-chunk and fell back to chunk-major, which pipelines
+  (8192-token windows overlap stages). The divider fleet must set
+  `STRATA_PREFILL_LAYER_MAJOR=0`.
+- **The pinned-complement stream is a per-BLOB pipeline.** With full residency
+  the complement is redundant insurance, and Main pays ~1 ms per blob: its
+  ~55k streamed blobs per chunk make chunk-major + complement the worst
+  combination (130 tok/s; ring 1024 made it WORSE, 119 - thrash theory dead;
+  the blob count, not the ring, is the cost). The 650-class run streamed the
+  same miss set through the arena file-cache path at ~5x lower per-miss cost.
+  With the solver guaranteeing divider residency, drop `STRATA_SPLIT_RELEASE`:
+  arena + chunk-major is the fleet configuration.
+
+## 11.10 M5 review (the honest matrix, after the 130 tok/s floor)
+
+One table, all runs on this rig (2080 Ti x16 main = GPU0, 3090 x1, 2080 Ti x1;
+Q6_K_XL; 18,632-token prompt). Streaming = where Main's cache misses come
+from: ARENA (file page cache) or PINNED (resident-experts blob tier).
+Geometry = layer-major (whole prompt per stage, serializes the chain) vs
+chunk-major (8192 windows, stages overlap). pp warm, tok/s:
+
+| context | streaming | geometry | ring | split     | pp    | note |
+|---------|-----------|----------|------|-----------|-------|------|
+| 131 K   | arena     | chunk*   | 384  | 5,11      | 650-661 | *forced: Main had no VRAM for a super-chunk |
+| 262 K   | pinned    | lm       | 96   | 7,13      | 300.7 | the yesterday number |
+| 262 K   | pinned    | lm       | 384  | 7,13      | 341.6 | Y1 - M5 funding improved it |
+| 262 K   | pinned    | lm       | 384  | 7,15 auto | 352.4 | M5c: promise kept (4096/4096, 0 streamed blobs) |
+| 262 K   | pinned    | chunk    | 384  | 7,15 auto | 130   | M5d - the floor: pinned x chunk-major = per-blob tax x 2.28 |
+| 262 K   | pinned    | chunk    | 1024 | 7,15 auto | 119-122 | ring theory dead: cost is per BLOB, more ring = fewer hits |
+| 262 K   | arena     | chunk 512(!) | 384 | 7,15 auto | 129 | boot hit an occupied port; "auto" sized chunks to 512 here |
+| 262 K   | arena     | chunk 8192 | 384 | auto (5,11) | 662.7-667.2 | WINNER: dividers stream 0, lockstep 7.7 s/8192 chunks |
+| 131 K   | single GPU (user's own config, GPU0 x16, arena) | - | - | - | 583-590 | THE parity baseline |
+
+The two rows above settled the case. `--prefill auto` on this split chose
+512-token chunks (the prompt path in own-buffer mode could not fund bigger
+staging beside the 262 K KV), and misses are re-swept EVERY chunk: Main moved
+8,578 experts per 512-token chunk (615 GB/prompt, GPU0 busy 77/80 s - never
+idle, just reading the world). Forcing `--prefill 8192` divides the sweep
+count by 16: 17,523 experts per 8192-token chunk, prompt 28 s, pp 663 - above
+the single-GPU baseline (585) and above the 131 K gold fleet (650-661), with
+full 262 K context and the divider promise held (trace: stage [0-5) and
+[5-11) stream 0 experts, per-chunk). The winning fleet recipe: arena tier +
+chunk 8192 + PROMPT_COST_MAIN + SPLIT_PP + SPLIT_OWN + auto split, no pinned
+tier, no layer-major. `STRATA_TRACE=1` per-chunk per-stage accounting (ms +
+experts streamed + handed-on/done) is what found it in one boot.
+
+Review of the implementation against the plan:
+
+- P1 (prompt path funded Main-only): WORKS, with one honest refinement - a
+  divider must still pay its chunk's activation staging (boot failure showed
+  a 512-token staging chunk not fitting when charged zero), and the SEARCH
+  must charge it too (else the solver over-promises: it gave CUDA1 9 layers,
+  serve shaved 529 pairs, the new WARNING line caught it - verify mode works).
+- P2 (pp-first auto solver): delivers the promise - K=7,15 chosen, 4096 of
+  4096 + 3584 of 3584 pairs resident, x1 per-prompt traffic 0.5/0.9 GB, hand-
+  offs only. Its objective (minimize the slowest stage's time) is BLIND to
+  geometry and streaming pipeline: it cannot see the two factors that now
+  dominate pp. Retarget is on hold until the arena 262 K number exists.
+- The law `pp = 8192 / max(t0, A)` holds, but t0 is not just compute + bytes:
+  the pinned tier costs ~1 ms per streamed BLOB (GPU0 was 77/80 s busy, only
+  ~6 s of it 33-layer compute). Arena chunk-major paid ~5x less per miss
+  (static from the 650 run's logs; to be confirmed at 262 K).
+- Logging gap FIXED: STRATA_TRACE=1 now prints per chunk per stage: tokens,
+  ms, experts streamed, and hands-on vs done (prefill.cpp, the pre-existing
+  trace line's gate; default byte-identical).
+- runner env_add still writes SPLIT_RELEASE - not reconciled until the arena
+  262 K verdict (if arena wins, pinned is divider-insurance only and the
+  fleet env drops it; the solver's residency is the promise, not the tier).
+- My forced `STRATA_PREFILL_LAYER_MAJOR=0` (M5d/e) was right for ARENA and
+  wrong for PINNED: it turned 352 into 130. Which geometry to run is a
+  property of the streaming tier - the plan's default must follow the tier,
+  not the split. The pinned tier is being dropped from the fleet anyway
+  (full residency makes it redundant insurance), pending the arena boot.
+
+## 12. Milestones
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.
 2. **M0B:** divider physics green on a fleet rig (needs ≥20 GB weak card(s)).
 3. **M1:** planner + vectors, usable via hand-written configs.
