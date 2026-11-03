@@ -5233,6 +5233,9 @@ int main(int argc, char** argv) {
     }
     // the stages' dense weights are trimmed to their own layers: asked for (an explicit split), or by the walk; under `auto` they load after the split search (late_weights)
     const bool later_trim = stage_trim || (walk_trim && !split_auto && !split_at.empty());
+    // M5-P4: what the whole-net dense (pool + native projections) costs on CUDA0's card - the trim credit and the
+    // serve-time reload both work from these measured bytes, never a priced model.
+    const uint64_t ndense_alloc = native_dense.allocated_bytes();
 
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
     strata::kernels::gr_set_native_mmvf(o.gr_native_mmvf);
@@ -6078,8 +6081,8 @@ int main(int argc, char** argv) {
             // share the range releases - the priced carve claimed 5.5 GiB of releasable weights on a card
             // whose whole pool is 1.4 GiB (boot measured: CUDA0 planned 2 layers, held 517/1024, aborted).
             const int64_t trim_credit =
-                (i == 0 && multi_gpu && trim_asked)
-                    ? (int64_t)((double)pool_bytes * (double)(g.n_layers - le) / (double)g.n_layers)
+                (i == 0 && late_weights)
+                    ? (int64_t)(((double)pool_bytes + (double)ndense_alloc) * (double)(g.n_layers - le) / (double)g.n_layers)
                     : 0;
             return cap[(size_t) i] + trim_credit - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) -
                    (i == 0 ? 0 : (int64_t) carve_bytes(lb, le));
@@ -6702,8 +6705,8 @@ int main(int argc, char** argv) {
                 const int64_t le = std::min(n, g.n_layers);
                 const int64_t pf_delta_mib = split_pf_mib > 0 ? (chunk - chunk_now) * 680 / 1024 : 0;
                 const int64_t trim_credit =
-                    (i == 0 && trim_asked)
-                        ? (int64_t)((double)pool_bytes * (double)(g.n_layers - le) / (double)g.n_layers)
+                    (i == 0 && late_weights)
+                        ? (int64_t)(((double)pool_bytes + (double)ndense_alloc) * (double)(g.n_layers - le) / (double)g.n_layers)
                         : 0;
                 return cap[(size_t) i] + trim_credit - pf_delta_mib * 1048576 -
                        (int64_t) strata::core::session_bytes(g, ctx, K, 0, le) - (i == 0 ? 0 : (int64_t) carve_bytes(0, le));
@@ -6981,6 +6984,56 @@ int main(int argc, char** argv) {
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+        // M5-P4 (the slot-0 fix): CUDA0's dense weights reloaded to its OWN range.  The split is unknown at load
+        // time, so CUDA0 carried the whole net's dense (pool 1.4 + native projections 3.5 GiB measured on the 3060
+        // rig) while later stages load only their range after the split (measured 1050 MiB for 2 layers) - a
+        // 12 GB first card lost its expert room to weights it never reads.  `weight_bytes_for` prices the share
+        // host-side from the GGUF headers, so the reload is verified smaller BEFORE anything is freed; the same
+        // `add_foreign` skip rule as `load_stage_weights` carves the pool; the search credited exactly this
+        // release (measured bytes x range share), so the plan and the card now agree.
+        if (late_weights && hi0 > 0 && hi0 < g.n_layers) {
+            std::set<std::string> skip0 = skip_base;   // the native-served names, as load_stage_weights does
+            add_foreign(0, hi0, skip0, o.mmap_experts);
+            uint64_t pool0 = 0, nd0 = 0;
+            bool ok = strata::core::WeightTable::pool_bytes(o.pack, pool0, err, &skip0);
+            if (ok && !o.native_dense_gguf.empty())
+                ok = strata::core::NativeDense::weight_bytes_for(o.native_dense_gguf, wt, o.native_ple_key, 0, hi0,
+                                                                 nd0, err);
+            if (!ok) {
+                std::fprintf(stderr, "strata generate: CUDA0 dense trim: %s\n", err.c_str());
+                return 1;
+            }
+            const int64_t back = (int64_t) (pool_bytes + ndense_alloc) - (int64_t) (pool0 + nd0);
+            if (back > (int64_t) (128u << 20) && pool0 <= pool_bytes && nd0 <= ndense_alloc) {
+                cudaFree(arena);
+                arena = nullptr;
+                wt.~WeightTable();
+                new (&wt) strata::core::WeightTable();
+                native_dense.~NativeDense();
+                new (&native_dense) strata::core::NativeDense();
+                uint64_t hc_re = 0;
+                strata::core::NativeDense::set_layer_range(0, (int) hi0);
+                const bool loaded = cudaMalloc(&arena, pool0) == cudaSuccess &&
+                                    wt.load(o.pack, arena, pool0, err, skip0.empty() ? nullptr : &skip0) &&
+                                    (!hc_q8 || wt.load_hc_q8(o.pack, hc_re, err)) &&
+                                    (o.native_dense_gguf.empty() ||
+                                     native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0, hi0));
+                strata::core::NativeDense::set_layer_range(-1, -1);
+                if (!loaded) {
+                    std::fprintf(stderr, "strata generate: CUDA0 dense trim: the range reload failed (%s)\n",
+                                 err.c_str());
+                    return 1;
+                }
+                size_t fb0 = 0, tb0 = 0;
+                cudaMemGetInfo(&fb0, &tb0);
+                std::fprintf(stderr, "strata generate: CUDA0 dense weights trimmed to layers 0-%lld: arena %llu -> "
+                                     "%llu MiB, projections %llu -> %llu MiB; %.2f GiB back, %.2f GiB free\n",
+                             (long long) (hi0 - 1), (unsigned long long) (pool_bytes >> 20),
+                             (unsigned long long) (pool0 >> 20), (unsigned long long) (ndense_alloc >> 20),
+                             (unsigned long long) (nd0 >> 20), (double) back / 1073741824.0,
+                             (double) fb0 / 1073741824.0);
+            }
+        }
         // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
         {

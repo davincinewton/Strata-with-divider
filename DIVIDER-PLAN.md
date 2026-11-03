@@ -601,6 +601,25 @@ dividers at high context, and where feasible they starve Main below the single 2
 the 3090/2080 Ti divider recipe (668-674) stays the config of this fleet until the 3060s earn a
 role at ~65 K or get bigger slots.
 
+## 11.12 M5-P4 (the slot-0 fix) and the verify-window defect cluster
+
+CUDA0's out-of-range dense weights now reload to its own range at serve time (`late_weights` gate:
+trim asked + multi-GPU + auto split - the same condition under which later stages load per-range).
+`NativeDense::weight_bytes_for` prices the share host-side before anything is freed; the reload
+reuses `add_foreign` + `set_layer_range` + `load_hc_q8` exactly as `load_stage_weights` does, with
+the static range reset after.  The search credit is the MEASURED pool + projections scaled by the
+share, and exists only where the reload will run (an explicit --layer-split already trimmed at
+boot, where a credit would double-count).  Measured on the 3060 rig: `arena 1416 -> 196 MiB,
+projections 3100 -> 160 MiB; 4.06 GiB back, 10.28 GiB free`, plan rose to K=2,4,6,8,10,12 with
+CUDA0 `holds 1024`, warnings 0, boot 385 s.  A 12 GB card in slot 0 is a normal divider now.
+
+The open defect: **Main's spec-verify expert copies** - three symptoms, one subsystem
+(verify.cpp's window): "waiting for the expert copies 4" forever (measured pre-P4, after a long
+prompt, CUDA0 still 1-layer); an illegal access in the tail chunk's copies (measured pre-P4, the
+24,736-token prompt); "verify: an illegal memory access" on the FIRST four-token request post-P4
+(measured) - so the cluster pre-dates P4, but P4 is not yet exonerated for the small-request
+variant; the rig could not be benched past it.  Next: trace verify.cpp:3344's copy queue.
+
 ## 12. Milestones
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.
 2. **M0B:** divider physics green on a fleet rig (needs ≥20 GB weak card(s)).
