@@ -734,7 +734,8 @@ def experts_loading_words(args: list, size: str) -> str:
 OPENS_BROWSER = False        # set in main() when the server was started with --open: only then may a message say a browser opens
 
 
-def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
+def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0,
+                  stage_gpus: list | None = None) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
     people closed the window thinking it had hung.  The warning comes at that step, not after it."""
@@ -748,6 +749,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
     loading = experts_loading_words(args, size)
     t0 = last = time.time()
     said = set()
+    split_rows: dict[int, tuple] = {}
 
     def say(key, text):
         nonlocal last
@@ -780,6 +782,28 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
                     say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
+                elif " runs layers " in line and "expert cache " in line:      # the layer table: a stage's share
+                    m = re.search(r"CUDA(\d+) runs layers (\d+)-(\d+), expert cache \d+ slots \((\d+\.\d+) GiB\), "
+                                  r"(\d+) of its (\d+) profiled", line)
+                    if m:
+                        split_rows[int(m[1])] = (m[2], m[3], m[4], m[5], m[6])
+                elif "budget, CUDA0 (measured card" in line:                    # the first card reports last: print
+                    m = re.search(r"layers (\d+)-(\d+);.*expert cache (\d+\.\d+) \((\d+) slots\); its (\d+) pairs", line)
+                    if m and len(split_rows) >= 2:
+                        split_rows[0] = (m[1], m[2], m[3], m[4], m[5])
+                        _a = lambda f, d: args[args.index(f) + 1] if f in args else d
+                        rows = []
+                        for i in sorted(split_rows):
+                            lo, hi, gib, held, total = split_rows[i]
+                            gpu = (f"GPU {stage_gpus[i]}" if stage_gpus and i < len(stage_gpus) else f"cuda{i}")
+                            tail = (f"experts: all {held} pinned, {gib} GiB" if int(held) >= int(total) else
+                                    f"cache {gib} GiB holds {held} of {total} - the rest streams over its link each chunk")
+                            rows.append(f"[strata]   CUDA{i}  {gpu:>7}  layers {lo}-{hi} "
+                                        f"({int(hi) - int(lo) + 1})   {tail}")
+                        say("split", f"[strata] how the layers are shared (context {_a('--max-context', '?')}, "
+                                     f"prompt chunk {_a('--prefill', 'default')}):\n" + "\n".join(rows) + "\n"
+                                     "[strata]   a divider that pins all its experts reads nothing back during prompts; "
+                                     "the last card (the head) streams what its cache misses.")
                 elif "session is up" in line:
                     say("up", "[strata] almost ready ...")
         if time.time() - last > heartbeat:
@@ -1048,8 +1072,10 @@ class StrataEngine:
         log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
         self.log_start = log_start                      # #596: the Monitor's conversation cache reads from here
         if log:
+            _cvd = str((env or {}).get("CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "")))
+            _stage = [x.strip() for x in _cvd.split(",") if x.strip()] or None
             threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
-                             daemon=True).start()
+                             kwargs={"stage_gpus": _stage}, daemon=True).start()
             # once per log: the follower keeps reading the same (appended) log across restarts and reloads
             if os.environ.get("STRATA_REQUEST_LINES") and os.path.abspath(log) not in _echoing:
                 _echoing.add(os.path.abspath(log))
