@@ -542,6 +542,47 @@ Review of the implementation against the plan:
   not the split. The pinned tier is being dropped from the fleet anyway
   (full residency makes it redundant insurance), pending the arena boot.
 
+## 11.11 M5-P3 (the 7-card fleet): the guard was a red herring - the ledger is the design
+
+The owner added six RTX 3060 12 GB (28 SM, 11.63 GiB, x1: probed 0.4 GB/s) as dividers behind the
+2080 Ti x16 Main at 262 K.  The boot's own lines: `pp-first finds no placement`, decode-balance
+fallback, every divider 75% short, 60-75 s per 8192 chunk re-streaming ~2.2k pairs over x1.  pp
+and decode crashed exactly as the arithmetic says they must: the promise costs 2.11 GiB of experts
++ 0.34 dense (priced 0.18 - the recurring `priced 580 took 1418`) + ~2.4-5.6 prompt staging per
+card, on an 11.63 GiB card.  `kMinStageLayers=3` (born in #1616 for the borrow-mode chunk clamp,
+576 -> 347 tok/s; #2644 refined the ordering) was NOT the blocker: the base search already runs at
+min 1 and the 3-layer retry vetoed nothing in these boots.
+
+The owner's rules, implemented fleet-gated (`SPLIT_PP`, defaults byte-identical):
+
+1. **minimum stage = one whole layer** (the min-3 retry is skipped in fleet mode - its disease,
+   the borrow-mode chunk clamp, cannot happen when stages keep their own buffers);
+2. **infeasible = ask, never break**: `THE PROMISE IMPOSSIBLE` prints a per-card ledger (what a
+   whole layer costs there, how many fit) and option 1 - the largest standard context every card
+   keeps the promise at, consent = restart with it (measured: the 262 K@8192 boot printed all seven
+   cards and offered 196608); nothing is served;
+3. **chunk hint, no action**: option 2 names the largest chunk step that would make the promise fit
+   (staging is 160 + chunk x 0.66 MiB per card), the exact config edit, and the measured re-sweep
+   cost (130 at 512 vs 668-674 at 8192).
+
+Found by this rig and fixed in the same pass: the pp search **never enumerated 5+ stages**
+(C(47,6) ~ 10.7M) - a pp capacity-greedy now places them (max-offload and min-each shapes,
+time-shaved, verified by `consider()`; planned K=2,4,6,8,10,12 at 262 K@4096).  The serve-side
+verify became a hard abort in pp mode - measured working: a 3-layer plan landing 1496/1536 (170
+MiB short) refused to serve with the measured budget lines as evidence; plans now carry 3% + 256
+MiB + 0.2 GiB/layer slack over the dense under-pricing.  CUDA1-5 then measured `holds 1024 of
+1024` - the promise tier itself is flawless.
+
+Two holes the compliant 195.6-tok/s boot exposed, measured: (a) **CUDA0's own cache was never
+verified** - it held 517 of 1024 while the stages' loop checked everyone else (same abort now
+added for CUDA0); (b) **Main's chunk stepped down 4096 -> 1536 -> 237** at serve: its cache sizing
+ate the staging reserve, every micro-chunk boundary re-swept ~9-16k experts, pp 195 against ~550
+planned.  (b) is the P1 follow-through owed: reserve Main's prompt staging for the planned chunk
+BEFORE sizing its cache.  Rig conclusion (arithmetic, not rules): the six 3060s cannot be pp-fleet
+dividers at high context, and where feasible they starve Main below the single 2080 Ti (583) -
+the 3090/2080 Ti divider recipe (668-674) stays the config of this fleet until the 3060s earn a
+role at ~65 K or get bigger slots.
+
 ## 12. Milestones
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.
 2. **M0B:** divider physics green on a fleet rig (needs ≥20 GB weak card(s)).
