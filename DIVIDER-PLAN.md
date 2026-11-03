@@ -582,6 +582,15 @@ at 262 K@4096: CUDA0 one whole layer (its honest room 2.76 + 1.37 - 0.2 GiB sess
 of ~4.3 MiB), CUDA1-5 two each, Main 37 - every card `holds all`, the boot either serves compliant
 or names the card that cannot.
 
+CUDA0's VRAM picture, fully traced (probe linked to the engine's own session_bytes/qsa_state_bytes,
+real geometry; plus the boot's mem-marks): the session for a one-layer range is 0.36 GiB (NOT the
+"4.15 session" I first said - corrected); the mark's 4254 MiB delta was 3619 MiB of NATIVE
+PROJECTION MATRICES ("495 native projection matrices", line 14, loaded whole-net before the split
+is known) on top of the 1.4 GiB pack pool - CUDA0 hoards ~4.9 GiB of whole-net dense weights to
+run one layer.  The reclaim of out-of-range weights on CUDA0 (pool + native projections, ~4.7
+reclaimable) is the slot-0 fix that would let a 12 GB card hold 2-3 expert layers; dividers never
+had it because they load after the split (measured: "its weights took 1050 MiB" for 2 layers).
+
 Two holes the compliant 195.6-tok/s boot exposed, measured: (a) **CUDA0's own cache was never
 verified** - it held 517 of 1024 while the stages' loop checked everyone else (same abort now
 added for CUDA0); (b) **Main's chunk stepped down 4096 -> 1536 -> 237** at serve: its cache sizing
