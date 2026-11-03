@@ -456,6 +456,9 @@ GEOMETRY and the streaming PIPELINE, not residency:
   same miss set through the arena file-cache path at ~5x lower per-miss cost.
   With the solver guaranteeing divider residency, drop `STRATA_SPLIT_RELEASE`:
   arena + chunk-major is the fleet configuration.
+  [SUPERSEDED by 11.10: the "~5x per-miss cost" was a geometry confound - at
+  equal chunks the tiers tie - and SPLIT_RELEASE stays, it is what keeps the
+  model out of anonymous RAM.]
 
 ## 11.10 M5 review (the honest matrix, after the 130 tok/s floor)
 
@@ -471,24 +474,31 @@ chunk-major (8192 windows, stages overlap). pp warm, tok/s:
 | 262 K   | pinned    | lm       | 96   | 7,13      | 300.7 | the yesterday number |
 | 262 K   | pinned    | lm       | 384  | 7,13      | 341.6 | Y1 - M5 funding improved it |
 | 262 K   | pinned    | lm       | 384  | 7,15 auto | 352.4 | M5c: promise kept (4096/4096, 0 streamed blobs) |
-| 262 K   | pinned    | chunk    | 384  | 7,15 auto | 130   | M5d - the floor: pinned x chunk-major = per-blob tax x 2.28 |
-| 262 K   | pinned    | chunk    | 1024 | 7,15 auto | 119-122 | ring theory dead: cost is per BLOB, more ring = fewer hits |
-| 262 K   | arena     | chunk 512(!) | 384 | 7,15 auto | 129 | boot hit an occupied port; "auto" sized chunks to 512 here |
-| 262 K   | arena     | chunk 8192 | 384 | auto (5,11) | 662.7-667.2 | WINNER: dividers stream 0, lockstep 7.7 s/8192 chunks |
+| 262 K   | pinned    | chunk 512(auto) | 384  | 7,15 auto | 130   | M5d - the floor: "auto" sized chunks to 512 here |
+| 262 K   | pinned    | chunk    | 1024 | 7,15 auto | 119-122 | ring theory dead: cost is per BLOB fetch, more ring = fewer hits |
+| 262 K   | arena     | chunk 512(auto) | 384 | 7,15 auto | 129 | tier tie at identical geometry - the "blob tax" was a confound |
+| 262 K   | arena     | chunk 8192 | 384 | auto (5,11) | 662.7-667.2 | geometry fix proven (this boot broke the RAM rule - next row is compliant) |
+| 262 K   | pinned    | chunk 8192 | 384 | auto (5,11) | 668.3-674.3 | COMPLIANT WINNER: 72 GiB page-locked complement only, dividers stream 0 |
 | 131 K   | single GPU (user's own config, GPU0 x16, arena) | - | - | - | 583-590 | THE parity baseline |
 
-The two rows above settled the case. `--prefill auto` on this split chose
-512-token chunks (the prompt path in own-buffer mode could not fund bigger
-staging beside the 262 K KV), and misses are re-swept EVERY chunk: Main moved
-8,578 experts per 512-token chunk (615 GB/prompt, GPU0 busy 77/80 s - never
-idle, just reading the world). Forcing `--prefill 8192` divides the sweep
-count by 16: 17,523 experts per 8192-token chunk, prompt 28 s, pp 663 - above
-the single-GPU baseline (585) and above the 131 K gold fleet (650-661), with
-full 262 K context and the divider promise held (trace: stage [0-5) and
-[5-11) stream 0 experts, per-chunk). The winning fleet recipe: arena tier +
-chunk 8192 + PROMPT_COST_MAIN + SPLIT_PP + SPLIT_OWN + auto split, no pinned
-tier, no layer-major. `STRATA_TRACE=1` per-chunk per-stage accounting (ms +
-experts streamed + handed-on/done) is what found it in one boot.
+Correction (same night): the "pinned tier ~1 ms/blob" claim above was WRONG -
+a confound. At identical geometry the tiers tie (pinned@512 130 vs
+arena@512 129); every pinned-vs-arena gap in the table was layer-major vs
+chunk size. The rule-relevant difference between the tiers is real but
+different: WITHOUT `--resident-experts` the engine's default loads the WHOLE
+model into private anonymous RAM (measured: Pss_Anon 104.4 GiB, 116 GB used -
+breaking the ssd-keep-only-truth rule); WITH it, only the streamed complement
+is page-locked (72 GiB at split 5,11; the GPU-resident divider pairs never
+occupy host RAM - the M4 skip) and pp is unchanged (668-674). The compliant
+fleet recipe is therefore yesterday's tier plus today's geometry:
+`--resident-experts` + SPLIT_RELEASE + chunk 8192 + PROMPT_COST_MAIN +
+SPLIT_PP + SPLIT_OWN + auto split. (`--mmap-experts` without pinning would
+pin nothing, but under RAM pressure its pages evict and prompts stall on the
+3.8 MB/s SSD reads - not the default choice.)  The complement size follows
+the solver's split: 58.98 GiB at 7,13 (yesterday), 72.07 GiB at the 5,11 the
+pp-first solver chose at 262 K - pairs moved to RAM as the split moved layers
+off the dividers; RAM evidence for the compliant boot: `free` used 11 G /
+avail 35 G, engine Pss_Anon 6.0 GiB (was 104.4 when the rule was broken).
 
 Review of the implementation against the plan:
 

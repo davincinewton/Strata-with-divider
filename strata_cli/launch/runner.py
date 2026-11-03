@@ -357,18 +357,24 @@ def divider_cards(mirror: dict, roles: dict, cards: list, base: dict | None) -> 
     # in divider_plan as advice; a number the user gave flows through untouched (the engine then only
     # verifies the promise and warns when it breaks).
     out["layer_split"] = "auto"
-    # M5 review (DIVIDER-PLAN 11.10): Main's cache misses stream through the arena file-cache tier, not a
-    # page-locked blob tier - the pinned tier costs ~1 ms per streamed blob (same rig, same split: 662 -> 130
-    # tok/s).  The solver's full pair residency on the dividers IS the no-dynamic-traffic promise; a pinned
-    # tier would be redundant insurance.  Prompt chunks: the engine's "auto" sizes them to whatever the
-    # prompt path can fund - when it must fund its own buffers that can shrink to 512, and a chunk boundary
-    # re-sweeps every layer's streamed experts (bytes per token x16 at 512 vs 8192; measured 130 -> 663).
-    # The fleet opts into 8192-token windows; a user --prefill in the config wins over it.
-    out["env_add"] = {"STRATA_STAGE_TRIM": "1", "STRATA_PROMPT_COST_MAIN": "1",
-                      "STRATA_SPLIT_PP": "1", "STRATA_SPLIT_OWN": "1"}
+    # M5 review (DIVIDER-PLAN 11.10): the fleet tier is the page-locked complement - WITHOUT --resident-experts
+    # the engine loads the WHOLE model into anonymous RAM (measured: 104 GiB Pss_Dirty, breaking the
+    # ssd-keep-only-truth rule); with it only the streamed pairs are pinned and GPU-resident divider weights
+    # never occupy host RAM.  pp is the same either way (668-674 vs 662-667: the tier gap was always geometry).
+    # Prompt chunks: the engine's "auto" sizes them to whatever the prompt path can fund - here that shrank
+    # to 512, and every chunk boundary re-sweeps each layer's streamed experts (bytes per token x16 vs 8192;
+    # measured 130 -> 668).  The fleet opts into 8192-token windows; a config's own --prefill wins.
+    out["env_add"] = {"STRATA_STAGE_TRIM": "1", "STRATA_SPLIT_RELEASE": "1",
+                      "STRATA_PROMPT_COST_MAIN": "1", "STRATA_SPLIT_PP": "1", "STRATA_SPLIT_OWN": "1"}
     gargs = out.get("args")
-    if isinstance(gargs, list) and "--prefill" not in gargs and "--prefill-pipe" not in gargs:
-        out["args"] = gargs + ["--prefill", "8192"]
+    if isinstance(gargs, list):
+        add = []
+        if "--resident-experts" not in gargs and "--mmap-experts" not in gargs:
+            add.append("--resident-experts")
+        if "--prefill" not in gargs and "--prefill-pipe" not in gargs:
+            add += ["--prefill", "8192"]
+        if add:
+            out["args"] = gargs + add
     out["divider_plan"] = dp["plan_text"]
     return out
 
