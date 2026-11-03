@@ -361,20 +361,14 @@ def divider_cards(mirror: dict, roles: dict, cards: list, base: dict | None) -> 
     # the engine loads the WHOLE model into anonymous RAM (measured: 104 GiB Pss_Dirty, breaking the
     # ssd-keep-only-truth rule); with it only the streamed pairs are pinned and GPU-resident divider weights
     # never occupy host RAM.  pp is the same either way (668-674 vs 662-667: the tier gap was always geometry).
-    # Prompt chunks: the engine's "auto" sizes them to whatever the prompt path can fund - here that shrank
-    # to 512, and every chunk boundary re-sweeps each layer's streamed experts (bytes per token x16 vs 8192;
-    # measured 130 -> 668).  The fleet opts into 8192-token windows; a config's own --prefill wins.
+    # Prompt chunks: the ENGINE defaults a pp-first fleet to --prefill 8192 (generate.cpp, M5 11.10: a probe-shrunk
+    # 512-token chunk re-sweeps the streamed experts at every boundary - 130 vs 668 tok/s measured); a --prefill
+    # the user set flows through, and --prefill auto asks the probe.  So the fleet writes no chunk of its own.
     out["env_add"] = {"STRATA_STAGE_TRIM": "1", "STRATA_SPLIT_RELEASE": "1",
                       "STRATA_PROMPT_COST_MAIN": "1", "STRATA_SPLIT_PP": "1", "STRATA_SPLIT_OWN": "1"}
     gargs = out.get("args")
-    if isinstance(gargs, list):
-        add = []
-        if "--resident-experts" not in gargs and "--mmap-experts" not in gargs:
-            add.append("--resident-experts")
-        if "--prefill" not in gargs and "--prefill-pipe" not in gargs:
-            add += ["--prefill", "8192"]
-        if add:
-            out["args"] = gargs + add
+    if isinstance(gargs, list) and "--resident-experts" not in gargs and "--mmap-experts" not in gargs:
+        out["args"] = gargs + ["--resident-experts"]
     out["divider_plan"] = dp["plan_text"]
     return out
 

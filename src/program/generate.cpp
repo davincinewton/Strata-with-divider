@@ -5229,6 +5229,26 @@ int main(int argc, char** argv) {
     // (#340: the estimate predates the streamed ring: from 1024-token chunks the prompt path also holds a ring of
     // whole expert blobs, which a split without borrowing sizes at 96 (Prefill::set_ring_override below) and books
     // here - without it a `--no-prefill-borrow` split filled the cards and the draft head no longer fit)
+    // M5 (DIVIDER-PLAN 11.10): a pp-first divider fleet DEFAULTS the prompt chunk to 8192 tokens.  Left to the
+    // probe, the own-buffer prompt path sized chunks to its leftover and they shrank to 512 - and every chunk
+    // boundary re-sweeps each layer's streamed experts, so Main's bytes per token multiplied (measured on one
+    // rig: 130 tok/s at 512-token chunks vs 668-674 at 8192, same split, same tier).  A --prefill the user
+    // typed always wins; if 8192 cannot be funded the buffer ladder steps it down as it always has.  Every
+    // other configuration keeps today's behavior exactly.
+    {
+        static const bool pp_fleet = [] {
+            const char* a = std::getenv("STRATA_SPLIT_PP");
+            const char* b = std::getenv("STRATA_PROMPT_COST_MAIN");
+            return (a != nullptr && a[0] == '1') || (b != nullptr && b[0] == '1');
+        }();
+        if (pp_fleet && multi_gpu && (o.prefill_auto || o.prefill_chunk <= 0)) {
+            o.prefill_auto = false;
+            o.prefill_chunk = 8192;
+            std::fprintf(stderr, "strata generate: the divider fleet defaults the prompt chunk to 8192 tokens "
+                                 "(a smaller one re-sweeps the streamed experts at every boundary); --prefill N overrides, "
+                                 "--prefill auto asks the probe\n");
+        }
+    }
     const int64_t split_ring_mib =
         (multi_gpu && !pf_borrow && o.prefill_chunk >= strata::prefill::Prefill::stream_all_min_tokens())
             ? (int64_t) ((96ull * (uint64_t) strata::kernels::cpu::expert_layout().max_blob + (1ull << 20) - 1) >> 20)
@@ -5296,10 +5316,10 @@ int main(int argc, char** argv) {
         const char* v = std::getenv("STRATA_SPLIT_OWN_PLACE");
         return v != nullptr && std::string(v) == "reserve";
     }();
-    // M5-P1 (DIVIDER-PLAN 11.9): a fully-resident x1 divider must never pay the prompt path's buffers and
-    // streamed ring out of its EXPERTS - measured, the re-stream that forces halves prefill (the prompt ring is
-    // the machinery of the stage whose cache streams: only that stage - the drafter's, Main - charges it).
-    // Off by default: byte-identical unless asked.
+    // M5-P1 (DIVIDER-PLAN 11.9): the streamed-expert ring is the machinery of the stage whose cache streams -
+    // only that stage (the drafter's, Main) charges it.  A fully-resident x1 divider keeps paying its chunk's
+    // activation staging but nothing of the ring: paid from its cache it becomes shaved experts, and the
+    // mid-prompt re-stream that follows halves prefill (measured).  Off by default: byte-identical unless asked.
     static const bool pf_main_only = [] {
         const char* v = std::getenv("STRATA_PROMPT_COST_MAIN");
         return v != nullptr && v[0] == '1';
@@ -5310,9 +5330,18 @@ int main(int argc, char** argv) {
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
-        const int64_t pf = (search && split_own_auto && !place_with_reserve)
+        // M5-P1 refinement: a divider pays its chunk's ACTIVATION staging (it runs prompt chunks of its own
+        // layers even when every expert is resident) but ZERO of the streamed-expert ring, which only the
+        // streaming stage (Main) uses.  Billed zero entirely, CUDA1 kept so many experts that even a
+        // 512-token staging chunk did not fit (measured: "device buffers for a chunk of 512 tokens do not fit
+        // (149 of 22001 MiB free)").
+        // Under STRATA_PROMPT_COST_MAIN the search must be as honest as serve: the old `search -> 0` optimism
+        // (sized as the borrowing configuration) let the pp-first solver promise 9 layers to a card that
+        // serve then shaved to 4079/4608 pairs (measured: the warning line, 29.8 GB of x1 re-stream, pp 260).
+        const int64_t pf = (search && split_own_auto && !place_with_reserve && !pf_main_only)
                                ? 0
-                               : (pf_main_only && multi_gpu && !drafter) ? 0 : split_pf_mib;
+                               : (pf_main_only && multi_gpu && !drafter) ? (split_pf_mib - split_ring_mib)
+                               : split_pf_mib;
         const int64_t base_reserve =
             later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
         strata::program::stage_reserve::Inputs rin;
@@ -5501,6 +5530,8 @@ int main(int argc, char** argv) {
         // (byte-identical).  The four-way branch scores its placements inline and is not retargeted here.
         bool split_pp = [] { const char* v = std::getenv("STRATA_SPLIT_PP"); return v != nullptr && v[0] == '1'; }();
         std::vector<int64_t> pairs_L((size_t) g.n_layers, 0);
+        double pp_main_ms = 0;      // the winning placement's Main chunk time (compute + streamed sweep)
+        double pp_sweep_gib = 0;    // ... and its streamed GiB per chunk, for the boot line
         if (split_pp)
             for (size_t r = 0; r < profile.size(); ++r)
                 if (profile[r].first >= 0 && profile[r].first < g.n_layers) ++pairs_L[(size_t) profile[r].first];
@@ -5646,11 +5677,41 @@ int main(int argc, char** argv) {
                     for (int64_t l = lb; l < le; ++l) want += pairs_L[(size_t) l];
                     if (held_cnt[(size_t) i] < want) return;
                 }
+                // pp time (M5-P2b, DIVIDER-PLAN 11.10): dividers hold everything and their prompt bytes are
+                // the hand-off - compute only.  Main pays its compute PLUS one streamed sweep of its layers'
+                // non-held pairs per chunk at its measured link: the sweep, not the compute, is what caps pp
+                // when Main carries too many layers for the slots it has left (tonight: 17.5k blobs per 8192
+                // chunk, 7.6 s/chunk, pp 668 - the same split at 512 chunks swept 4x per token-time, pp 130).
+                double pp_ms = 0;
+                for (int i = 0; i + 1 < ns; ++i) {
+                    const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = at[(size_t) i];
+                    pp_ms = std::max(pp_ms, layer_ms[(size_t) i] * (double) (le - lb));
+                }
+                {
+                    const int64_t m_lb = at[(size_t) ns - 2];
+                    const int64_t m_l = g.n_layers - m_lb;
+                    double main_ms = layer_ms[(size_t) ns - 1] * (double) m_l;
+                    double sweep_bytes = 0;
+                    int64_t m_pairs = 0;
+                    for (int64_t l = m_lb; l < g.n_layers; ++l) {
+                        m_pairs += pairs_L[(size_t) l];
+                        sweep_bytes += (double) pairs_L[(size_t) l] * (double) cost(l);
+                    }
+                    const int64_t held_m = held_cnt[(size_t) ns - 1];
+                    if (m_pairs > 0)
+                        sweep_bytes *= (double) (m_pairs - std::min(held_m, m_pairs)) / (double) m_pairs;
+                    const double bw = link_gbps[(size_t) ns - 1];
+                    if (bw > 0.0)
+                        main_ms += sweep_bytes / (1e6 * bw);   // GB/s -> ms per chunk at this chunk size
+                    pp_ms = std::max(pp_ms, main_ms);
+                    pp_main_ms = main_ms;
+                    pp_sweep_gib = sweep_bytes / 1073741824.0;
+                }
                 const int64_t main_l = g.n_layers - at[(size_t) ns - 2];
                 const int64_t best_main = best.empty() ? g.n_layers + 1 : g.n_layers - best[(size_t) ns - 2];
-                if (mx < best_max - tie_eps || (mx <= best_max + tie_eps && main_l < best_main)) {
+                if (pp_ms < best_max - tie_eps || (pp_ms <= best_max + tie_eps && main_l < best_main)) {
                     if (gate_on && !can_start(parts_of(at))) return;
-                    best = at; best_ms = ms; best_mass = hm; best_held = held; best_max = mx;
+                    best = at; best_ms = ms; best_mass = hm; best_held = held; best_max = pp_ms;
                 }
                 return;
             }
@@ -5890,8 +5951,10 @@ int main(int argc, char** argv) {
                      ks.c_str(), best_ms, (long long) best_held, profile.size(), 100.0 * best_mass, (long long) tried);
         if (split_pp)
             std::fprintf(stderr, "strata generate: layer split auto: pp-first - every divider stage holds its layers' full "
-                                 "pair set at this context (no re-stream during prompts); decode window %.1f ms is advisory\n",
-                         best_ms);
+                                 "pair set at this context (no re-stream during prompts); Main chunk %.1f ms "
+                                 "(compute + %.2f GiB streamed sweep per %lld-token chunk at its link); decode window "
+                                 "%.1f ms is advisory\n",
+                         pp_main_ms, pp_sweep_gib, (long long) o.prefill_chunk, best_ms);
         // #1428: a near tie on a mixed pair.  The model prices a decode window only (the prompt path is not in it), and on
         // cards of different speed or link the winner can flip within a few percent of error: say which other split is
         // almost as good, so the user can try it.  Recommend, never force: this only prints.
