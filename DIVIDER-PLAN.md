@@ -491,14 +491,28 @@ breaking the ssd-keep-only-truth rule); WITH it, only the streamed complement
 is page-locked (72 GiB at split 5,11; the GPU-resident divider pairs never
 occupy host RAM - the M4 skip) and pp is unchanged (668-674). The compliant
 fleet recipe is therefore yesterday's tier plus today's geometry:
-`--resident-experts` + SPLIT_RELEASE + chunk 8192 + PROMPT_COST_MAIN +
-SPLIT_PP + SPLIT_OWN + auto split. (`--mmap-experts` without pinning would
+`--resident-experts` + SPLIT_RELEASE + PROMPT_COST_MAIN + SPLIT_PP +
+SPLIT_OWN + auto split (the 8192 chunk is now the engine's fleet default,
+not a config line). (`--mmap-experts` without pinning would
 pin nothing, but under RAM pressure its pages evict and prompts stall on the
 3.8 MB/s SSD reads - not the default choice.)  The complement size follows
 the solver's split: 58.98 GiB at 7,13 (yesterday), 72.07 GiB at the 5,11 the
 pp-first solver chose at 262 K - pairs moved to RAM as the split moved layers
 off the dividers; RAM evidence for the compliant boot: `free` used 11 G /
 avail 35 G, engine Pss_Anon 6.0 GiB (was 104.4 when the rule was broken).
+
+**P2b (same night, measured):** the pp objective now prices the sweep, not
+just the compute.  A pp placement is scored by `max over stages of`: a
+divider pays its layers' compute only (residency makes its prompt bytes the
+hand-off); Main pays its compute PLUS one streamed sweep of its non-held
+pairs per chunk at its measured link.  And the fleet's chunk default moved
+into the engine: a pp fleet with no user `--prefill` runs 8192-token chunks
+(a typed `--prefill N` wins; `--prefill auto` still asks the probe).  The
+solver then predicted its own choice before any prompt: K=5,11, Main chunk
+7027 ms (70.99 GiB sweep + compute) - the boot's trace measured 7255-7866 ms
+per 8192 chunk and pp 666-673 tok/s with `--prefill` removed from the config
+entirely.  The prediction matches the reality inside ~10%: the algorithm now
+sees what the config used to carry.
 
 Review of the implementation against the plan:
 
