@@ -36,6 +36,10 @@ public:
     /// only, so it allocates nothing and needs no device (#1238).  `table` must hold every tensor the shards carry.
     static bool weight_bytes_for(const std::vector<std::string>& shards, WeightTable& table, bool include_ple_key,
                                  int64_t lb, int64_t le, uint64_t& out, std::string& err);
+    // M5-P5: the same price with no canonical table (the deferred first stage: the weights are not loaded yet).
+    // It trusts the GGUF tensor shapes; the load itself re-runs every check that matters.
+    static bool weight_bytes_for(const std::vector<std::string>& shards, bool include_ple_key,
+                                 int64_t lb, int64_t le, uint64_t& out, std::string& err);
     /// #326: a native pack whose `blk.1.ple_key.weight` row is unquantized (iq_pack --compat-bf16 of a GGUF key
     /// the native kernel also reads, e.g. OrcaRouter's IQ3_XXS) serves the PLE from that row, so it is taken out
     /// of `skip` and `load` does not upload the GGUF key over it.  A quantized row leaves `skip` unchanged.
