@@ -674,9 +674,52 @@ Two code defects, both measured against the running fleet:
    `active`) before growing.
 
 `STRATA_RING_TRACE=1` (opt-in, added this session) gives the issuer/compute join points and
-stall counters used above. **Status: both fixes are committed (compile-clean); the one-boot
-verification and the 262K/chunk-4096 pp bench are pending a GPU reset** - the box is currently
-down at the driver level, see 11.15.
+stall counters used above. **Status after the post-reboot verification: both fixes are in the
+binary and the early mid-run stall is gone, but a 7-stage long-prompt freeze PERSISTS, in a new
+shape (moved downstream to the main's second chunk, and one run ends in a `copy_i32` illegal
+access). The 262K/chunk-4096 pp bench is still pending - see 11.16.**
+
+## 11.16 the freeze moved to the main's hand-off; root cause: a 2-deep hand-off buffer vs a
+## growing pipeline (measured; fix designed, one-boot confirmation pending)
+
+Hardware: 7 cards. 0 = 2080 Ti 22.5 GiB x16 = MAIN (10.9 GB/s); 1-6 = 3060 12 GiB x1 = dividers
+(0.4 GB/s). Placement (auto, pp-first): [0,2)..[10,12) are two-layer dividers holding their full
+pair set (`0 experts streamed`); [12,48) is the main (36 layers, ~16227 experts streamed per
+1536-token chunk, 6.7-7.6 s/chunk on the x16 link). The chunk is 1536, not 4096: a 4096 chunk's
+prompt buffers need 3654 MiB on the main and only 3339 were free at prompt-path init.
+
+Measured on the compliant build (M5-P5 + the two 11.14 fixes, `STRATA_RING_TRACE=1`):
+- Three consecutive ~18.6k prompts FROZE (60 s watchdog, `done: 0 tokens`). Two were pure
+  deadlocks (every expert-pool worker parked, no fault); one ended in a `copy_i32` illegal memory
+  access on the main's SECOND chunk.
+- The watchdog's stall stage is the chunk-end hand-off sync
+  ("finishing the chunk from token 1536"): a stage's own `cudaStreamSynchronize(cs)` at the
+  layer-split hand-off.
+- The dividers run AHEAD of the main by up to ~8 chunks in the frozen runs (stage [0,2) reached
+  chunk 12288 while the main was still on its second chunk).
+- Divider per-chunk time GROWS down the prompt (QSA attention vs KV length), measured on [2,4):
+  496, 494, 592, 977, 1341, 6946 ms for chunks @0..@7680.
+
+Root cause (static analysis of the hand-off + the measured run-ahead): the layer-split hand-off
+is a DOUBLE buffer - `m.hand[2]`, `hand_buf_ ^= 1`, "the current hand-off slot was used two
+chunks ago". On the active path (`STRATA_HANDOFF_PIPE` unset, `hp == 0`) the CONSUMER does a bare
+`cudaMemcpyAsync(m.R, hand_in_+c0*D, T*D*4, H2D, cs)` with no event wait, and the PRODUCER
+host-serializes only against the DIRECT successor's PREVIOUS chunk (`next_run_.get()`). The slot a
+producer writes for chunk k+2 is the same pinned slot the consumer reads for chunk k; the invariant
+"the consumer finishes chunk k before the producer writes chunk k+2" holds only while the consumer
+stays < 2 chunks behind its producer. Here the main (the slowest stage, 7 s/chunk) is the consumer
+of the [10,12)->[12,48) hand-off and the fast dividers (the producers) run up to 8 chunks ahead,
+so the producer overwrites a slot the main is still reading: torn rows -> wrong routing -> the
+`copy_i32` IMA face, or the sync/event ordering folds into the pure-deadlock face. The 3-stage
+runs (673 tok/s, 8192-token chunks, main [11,48)) kept the head < 2 chunks ahead and never hit it;
+the one 3-stage freeze in the log was at token 24583 of a 24702 prompt (the tail, where the
+per-chunk growth is largest) - the same mechanism.
+
+Fix (env-gated, default byte-identical at depth 2): deepen the hand-off buffers from 2 to N
+(`STRATA_HANDOFF_DEPTH`, clamp 2..8): `m.hand[2]`/`hand_done[2]`/`hand_ev[2][..]` -> `[N]`,
+`hand_buf_ = (hand_buf_+1) % N`. With N above the maximum head-to-tail lag, an overwrite can no
+longer reach a slot still in flight. Confirm by one boot: the 18.6k prompt must complete (pp
+measured) with `STRATA_HANDOFF_DEPTH=4` where it froze at depth 2.
 
 ## 11.15 environment: GPU7 stuck at reset (measured)
 
@@ -689,6 +732,48 @@ UVM pool for every device, so the runtime enumerates zero GPUs even with GPU7 ex
 `CUDA_VISIBLE_DEVICES`. NVML does not use the UVM pool, which is why nvtop/nvidia-smi still work.
 Recovery needs a root-level GPU reset or a reboot (this account has neither); after that, the
 pending verification boot and pp bench (11.14) are the next actions.
+
+### 11.17 The wedge hunt: probes, forensics, and what they ruled out (measured 2026-11-04, same fleet)
+
+The depth-4 handoff hardening (11.16) moved the freeze two chunks later but did not fix it, so the
+search switched to measurement inside the freeze. What was built (all behind `STRATA_RING_TRACE`,
+default path byte-identical): probes at run entry/setup/chunk-loop entry, handoff cs-sync +
+successor-wait + submit with timings, per-chunk callbacks and `mtp.prefill`, the issuer join with
+issued-counts, the stager old-generation drain, `drain_pipeline`, the verify copy-sync, and a
+stall-report section that groups every engine thread by (name, state, syscall) and shows CPU jiffies
+burned between its two passes (a thread stuck in a spin shows ~200 jiffies per 2 s). An external
+`gdb` attach is impossible here (`ptrace_scope=1`), so the same report fires SIGUSR1 at every thread
+and the handler backtraces itself - stacks without ptrace.
+
+Measured, three wedge shapes, same 18 299-token repro:
+
+1. **Mid-chain stall (twice).** Every stage completes chunk k; one middle stage (once [4,6),
+   once [6,8)) enters chunk k+1's `run_impl` and never reaches the issuer-join probe; everything
+   downstream starves and the head [0,2) runs ~3 chunks ahead and parks in its successor-wait.
+   The head always advances several chunks past the stall point, so this is not a full-chain deadlock.
+2. **Late stall.** Eight chunks complete on every stage; then the same silence, same shape.
+3. **Callback-edge stall.** Main completes chunk@0 fully (callbacks and `mtp.prefill` printed done),
+   and the next chunk's compute never begins on the stage whose successor-wait was outstanding.
+
+Ruled out by measurement, not by reading:
+
+- **Card health.** A per-card sweep (1.5 GiB pattern write/verify, H2D/D2H round-trip, compute
+  kernel, all 7 GPUs) passed everywhere: `SUMMARY: 0 bad of 7`.
+- **A GPU-side fault during the freeze.** `/var/log/kern.log` records no Xid at either freeze
+  timestamp; the one Xid 13 (warp out-of-range) today at 15:35 on GPU5 belongs to the separate
+  `copy_i32` illegal-access face, not to these silent stalls.
+- **The driver or the GPU.** The stall report shows zero threads in `ioctl`, the expert pool idle
+  (0 jobs, all workers parked), 0 disk-D threads, 36 GiB RAM free, no swap, and `released the
+  verify window's GPU waits: the GPU finished in 0 ms` at teardown - the hardware drained instantly.
+- **The handoff depth.** Depth 2 and depth 4 both wedge (11.16); the pinned-slot overwrite theory
+  is dead; the depth stays as hardening.
+
+What the forensics point at: at the freeze one engine thread is always in state R burning ~100 %
+of its core in user space (`+201 jiffies` over the report's 2 s, no syscall), and the SIGUSR1
+stack dump - not yet captured at writing time - will name the loop. The un-probed user-space spins
+in the chunk walk are the issuer feed wait (`while (a_issued <= k) yield()`, no probe, no timeout)
+and the stager's ready-wait. Next: read the dumped stacks, then fix the named loop with a bounded
+wait plus a stall print, the way the issuer's ring-full spin already does.
 
 ## 12. Milestones
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.
