@@ -712,13 +712,26 @@ struct Stager {
     /// A layer's jobs; the previous layer's are finished (finish()).
     void start(std::vector<Job>&& js) {
         if (js.empty()) return;
-        std::lock_guard<std::mutex> lk(mu);
-        jobs = std::move(js);
         if (ready_cap < jobs.size()) {
+            // The threaded walk ends a run without finish() (StagerDone is a no-op there), so a previous
+            // generation's threads can still be inside work() reading ready[] while this generation grows
+            // it: the reset used to free the array under them (an issuer stuck forever on a job whose ready
+            // flag its thread wrote to freed memory, and unwritten pinned buffers read as ready - the fleet's
+            // prompt-pipeline hang and the copy_i32 illegal access, one defect).  Retire the old generation
+            // first - the same stop finish() does - and grow only once no thread is inside the arrays.
+            head.store((uint64_t) gen << 32, std::memory_order_release);   // n = 0: nothing more to claim
+            issued.store(1 << 30, std::memory_order_release);
+#if defined(STRATA_ATOMIC_WAIT)
+            issued.notify_all();
+#endif
+            for (size_t i = 0; i < ready_cap; ++i) ready[i].store(1, std::memory_order_release);
+            while (active.load(std::memory_order_acquire) != 0) std::this_thread::yield();
             ready_cap = jobs.size() * 2;
             ready.reset(new std::atomic<int>[ready_cap]);
             skipped.reset(new std::atomic<char>[ready_cap]);
         }
+        std::lock_guard<std::mutex> lk(mu);
+        jobs = std::move(js);
         for (size_t i = 0; i < jobs.size(); ++i) {
             ready[i].store(0, std::memory_order_relaxed);
             skipped[i].store(0, std::memory_order_relaxed);
@@ -1100,6 +1113,7 @@ struct Prefill::Impl {
     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
     // `used` of the last slot gathered with it, recorded once for all of them (a later record only waits longer)
     int used_of[RING_MAX] = {};
+    unsigned useq = 0;              // the next flush event: m.used[useq++ % RING_MAX] marks one flush
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -1611,6 +1625,14 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     // one-time: events, the stager, the host buffers (for the largest chunk), the identity page table
     for (int i = 0; i < ring_cap(); ++i) {
         if (cudaEventCreateWithFlags(&m.copied[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
+    }
+    // The release markers are NOT the slot ring's events: every flush gets its own event from this pool, so an
+    // issue-time capture of used[used_of[slot]] can never hold a LATER flush's record.  With events indexed by
+    // slot, the expert-kernel walk (which records at consume boundaries, ungated, so its host-side records run
+    // ahead) re-recorded the MMQ walk's events: a copy could capture a record of a kernel layer that sits behind
+    // the compute stream's own blocked wait - a cycle (measured on the 7-stage fleet: the prompt pipeline froze
+    // on a chunk whose streamed copies ended behind such a captured future record, deterministically per routing).
+    for (int i = 0; i < RING_MAX; ++i) {
         if (cudaEventCreateWithFlags(&m.used[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
     }
     if (!m.stager) {
@@ -3525,11 +3547,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 };
                 // before the issuer waits: what it issued is covered, so no consumer waits on an entry with no event
                 auto cover = [&](size_t idx) { if (sparse_copied && idx > 0 && last_rec < (int64_t) idx - 1) record(idx - 1); };
+                const bool ring_trace = std::getenv("STRATA_RING_TRACE") != nullptr;
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
-                    while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
-                        cover(idx);
-                        if (a_stop.load(std::memory_order_acquire)) return;
-                        std::this_thread::yield();
+                    if (ring_trace && idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
+                        const auto t_wait = Clock::now();
+                        for (;;) {
+                            cover(idx);
+                            if (a_stop.load(std::memory_order_acquire)) return;
+                            if (idx < a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) break;
+                            const double waited = std::chrono::duration<double>(Clock::now() - t_wait).count();
+                            if (waited > 2.0 && static_cast<int>((waited - 2.0) * 100) % 500 == 0)
+                                std::fprintf(stderr, "strata ring-trace: issuer stage [%lld,%lld) stalled at entry %zu/%zu, "
+                                                     "consumed=%zu, ring=%d\n", (long long) stage_lb_, (long long) stage_le_,
+                                             idx, seq.size(), a_consumed.load(std::memory_order_acquire), m.ring);
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        }
+                        continue;
                     }
                     const StreamEntry& en = seq[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
@@ -3557,7 +3590,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         ++iss_dma;
                     } else {
                         cover(idx);   // the stager may make the issuer wait
+                        const auto tw = Clock::now();
                         const uint8_t* hb = m.stager->wait(en.job);
+                        if (ring_trace && std::chrono::duration<double>(Clock::now() - tw).count() > 2.0)
+                            std::fprintf(stderr, "strata ring-trace: issuer stage [%lld,%lld) entry %zu waited on stager "
+                                                 "job %lld\n", (long long) stage_lb_, (long long) stage_le_, idx,
+                                         (long long) en.job);
                         cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                         m.stager->issued_one(en.job, m.copy);
                     }
@@ -3567,6 +3605,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     iss_ms += ms_since(th);
                     ++iss_streamed;
                     a_issued.store(idx + 1, std::memory_order_release);
+                    if (ring_trace && idx + 1 == seq.size())
+                        std::fprintf(stderr, "strata ring-trace: issuer stage [%lld,%lld) issued the last entry\n",
+                                     (long long) stage_lb_, (long long) stage_le_);
                 }
             });
         } else if (stream_all) {
@@ -3585,7 +3626,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 cudaStreamWaitEvent(m.cs, m.copied[slot], 0);
                 return;
             }
-            while (a_rec.load(std::memory_order_acquire) <= k) std::this_thread::yield();
+            if (std::getenv("STRATA_RING_TRACE") != nullptr && a_rec.load(std::memory_order_acquire) <= k) {
+                const auto t_wait = Clock::now();
+                while (a_rec.load(std::memory_order_acquire) <= k) {
+                    const double waited = std::chrono::duration<double>(Clock::now() - t_wait).count();
+                    if (waited > 2.0 && static_cast<int>((waited - 2.0) * 100) % 500 == 0)
+                        std::fprintf(stderr, "strata ring-trace: compute stage [%lld,%lld) waits entry %zu, rec=%zu, "
+                                             "issued=%zu, consumed=%zu\n", (long long) stage_lb_, (long long) stage_le_,
+                                     k, a_rec.load(std::memory_order_acquire), a_issued.load(std::memory_order_acquire),
+                                     a_consumed.load(std::memory_order_acquire));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
             const size_t hi = a_rec.load(std::memory_order_acquire);
             // (hi - 1 is always recorded, so the last entry is only the fallback that covers k all the same)
             const size_t r = strata::prefill::copy_event_entry(k, hi, [&](size_t e) {
@@ -4329,8 +4381,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             }
                             for (size_t kk = k0; kk < k; ++kk) {
-                                cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
-                                m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
+                                const int rel = (int) (m.useq++ % (unsigned) RING_MAX);
+                                cudaEventRecord(m.used[rel], m.cs);
+                                m.used_of[kk % (size_t) m.ring] = rel;
                             }
                             if (k > k0) {
                                 consumed = k;
@@ -5223,7 +5276,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                             }
                             if (gg_nslots > 0) {
-                                const int rel = gg_slots[gg_nslots - 1];
+                                const int rel = (int) (m.useq++ % (unsigned) RING_MAX);
                                 cudaEventRecord(m.used[rel], m.cs);
                                 for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
                             }
@@ -5276,7 +5329,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                m.grp_d + (size_t) c * mmq_db, m.cs);
                                         }
                                     }
-                                    if (slot >= 0 && !gg_now) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                    if (slot >= 0 && !gg_now) {
+                                        const int rel = (int) (m.useq++ % (unsigned) RING_MAX);
+                                        cudaEventRecord(m.used[rel], m.cs); m.used_of[slot] = rel;
+                                    }
                                     if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                     if (gg_now) {   // also when the last entry was direct (a no-op without gathers)
                                         flush(0);
@@ -5314,7 +5370,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         cudaMemsetAsync(m.grp_d + (size_t) (q + 1) * mmq_db, 0, MMQ_TAIL, m.cs);
                                     }
                                 }
-                                if (slot >= 0 && !gg_now) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                if (slot >= 0 && !gg_now) {
+                                    const int rel = (int) (m.useq++ % (unsigned) RING_MAX);
+                                    cudaEventRecord(m.used[rel], m.cs); m.used_of[slot] = rel;
+                                }
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                 }
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
@@ -5392,7 +5451,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }
-                            if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                            if (slot >= 0) {
+                                const int rel = (int) (m.useq++ % (unsigned) RING_MAX);
+                                cudaEventRecord(m.used[rel], m.cs); m.used_of[slot] = rel;
+                            }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             pt.mark(kPfGemmGU, cs);
                             m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
@@ -5460,8 +5522,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 while (k < kend && seq[k].e < e_stop) {
                                     if (gg_nslots > 0) flush(0);   // the open group's slots get their event first
                                     const int sl = (int) (k % (size_t) m.ring);
-                                    cudaEventRecord(m.used[sl], m.cs);
-                                    m.used_of[sl] = sl;
+                                    const int rel = (int) (m.useq++ % (unsigned) RING_MAX);
+                                    cudaEventRecord(m.used[rel], m.cs);
+                                    m.used_of[sl] = rel;
                                     consumed = ++k;
                                     give_back(consumed);
                                 }
@@ -5631,6 +5694,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
         if (issuer.joinable()) {
+            if (std::getenv("STRATA_RING_TRACE") != nullptr)
+                std::fprintf(stderr, "strata ring-trace: compute stage [%lld,%lld) joins the issuer (issued=%zu/%zu)\n",
+                             (long long) stage_lb_, (long long) stage_le_,
+                             a_issued.load(std::memory_order_acquire), seq.size());
             issuer.join();
             stats_.ms_experts_host += iss_ms;
             stats_.experts_streamed += iss_streamed;
@@ -6642,8 +6709,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         blob_dequant_f16(blob_dev, m.dq_gu[dq], m.dq_d[dq], cs);
                     }
                     if (stage_of[u] >= 0) {   // the blob is read by the dequant: its ring slot is free
-                        cudaEventRecord(m.used[stage_of[u]], cs);
-                        m.used_of[stage_of[u]] = stage_of[u];
+                        const int rel = (int) (m.useq++ % (unsigned) RING_MAX);
+                        cudaEventRecord(m.used[rel], cs);
+                        m.used_of[stage_of[u]] = rel;
                     }
                 }
                 // this entry's rows (group-relative offset o): FP16 inputs, gate/up, SwiGLU, down
@@ -6672,8 +6740,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, cs);
             }
             if (j == last_ent[u] && stage_of[u] >= 0) {   // the blob is read: its ring slot is free
-                cudaEventRecord(m.used[stage_of[u]], cs);
-                m.used_of[stage_of[u]] = stage_of[u];
+                const int rel = (int) (m.useq++ % (unsigned) RING_MAX);
+                cudaEventRecord(m.used[rel], cs);
+                m.used_of[stage_of[u]] = rel;
             }
             if (j + 1 < gp.j1) continue;
             // ---- the group's products over all of its rows of the super-chunk, then the rows added per token
