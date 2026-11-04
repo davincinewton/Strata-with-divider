@@ -121,6 +121,9 @@
 #include "strata/program/par_counters.hpp"
 #if defined(__linux__)
 #include <execinfo.h>
+#include <sys/syscall.h>
+#include <signal.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
@@ -1841,6 +1844,124 @@ static void print(std::FILE* f) {
 }
 }  // namespace stall_stacks
 #endif
+#if !defined(_WIN32)
+#if defined(__linux__)
+/// STRATA_RING_TRACE: every-thread stack dump at the stall.  The watchdog fires SIGUSR1 at each thread and the
+/// handler backtraces ITSELF - no ptrace, works where yama's ptrace_scope blocks an external gdb.
+void bt_sweep_handler(int) {
+    void* frames[40];
+    const int n = backtrace(frames, 40);
+    char hdr[96];
+    const int hl = std::snprintf(hdr, sizeof hdr, "=== stall-bt tid=%d ===\n", (int) syscall(SYS_gettid));
+    (void) !write(2, hdr, (size_t) (hl > 0 ? hl : 0));
+    backtrace_symbols_fd(frames, n, 2);
+}
+#endif
+
+/// STRATA_RING_TRACE: the stall probe's per-thread forensics.  /proc/self/task needs no ptrace for one's own
+/// process: thread name, state, the syscall it waits in, and the CPU jiffies it burned between the report's two
+/// passes.  Threads are grouped (name, state, syscall); a group that burns CPU is spinning in user space, one
+/// waiting in ioctl (16) is inside the driver, one in futex (202) waits on a host lock.  The two groups that
+/// matter for the fleet's prompt-pipeline wedge are the stage compute threads (comm "strata"): whether they
+/// spin, block in the driver, or wait on a lock says which of the three the wedge is.
+void thread_forensics(std::FILE* f) {
+    static std::map<int, unsigned long long> prev_cpu;
+    std::map<int, unsigned long long> now_cpu;
+    struct Key {
+        std::string comm;
+        char state;
+        long sc;
+        bool operator<(const Key& o) const {
+            if (comm != o.comm) return comm < o.comm;
+            if (state != o.state) return state < o.state;
+            return sc < o.sc;
+        }
+    };
+    std::map<Key, int> groups;
+    std::vector<std::string> hot;   // spinning / uninterruptible threads, printed one per line
+    std::error_code ec;
+    int total = 0;
+    for (const auto& e : std::filesystem::directory_iterator("/proc/self/task", ec)) {
+        std::ifstream cm(e.path() / "comm");
+        std::string comm;
+        std::getline(cm, comm);
+        std::ifstream st(e.path() / "stat");
+        std::string line;
+        std::getline(st, line);
+        const size_t rp = line.rfind(')');
+        if (rp == std::string::npos || rp + 2 >= line.size()) continue;
+        const char state = line[rp + 2];
+        unsigned long long ut = 0, stm = 0;
+        {   // fields after the ')': state is 3, utime 14, stime 15 - count whitespace tokens
+            const char* q = line.c_str() + rp + 2;
+            int idx = 2;
+            while (*q != '\0') {
+                while (*q == ' ') ++q;
+                if (*q == '\0') break;
+                ++idx;
+                const char* tok = q;
+                while (*q != '\0' && *q != ' ') ++q;
+                if (idx == 14) ut = std::strtoull(tok, nullptr, 10);
+                else if (idx == 15) { stm = std::strtoull(tok, nullptr, 10); break; }
+            }
+        }
+        std::ifstream sy(e.path() / "syscall");
+        std::string scs;
+        std::getline(sy, scs);
+        const long sccall = scs.empty() || scs[0] < '0' ? -1 : std::atol(scs.c_str());
+        const int tid = std::atoi(e.path().filename().string().c_str());
+        const unsigned long long cpu = ut + stm;
+        now_cpu[tid] = cpu;
+        const unsigned long long dcpu = prev_cpu.count(tid) != 0 ? cpu - prev_cpu[tid] : 0;
+        ++total;
+        if (state == 'R' || state == 'D' || dcpu > 0) {
+            char buf[192];
+            std::snprintf(buf, sizeof buf, "tid=%d \"%s\" state=%c syscall=%ld +%llu jiffies",
+                          tid, comm.c_str(), state, sccall, dcpu);
+            hot.emplace_back(buf);
+        }
+        ++groups[Key{comm, state, sccall}];
+    }
+#if defined(__linux__)
+    {   // the stacks of every thread (skip our own - the report thread); 25 ms apart to interleave readably
+        static const bool bt_on = std::getenv("STRATA_RING_TRACE") != nullptr;
+        static bool sig_set = false;
+        if (bt_on && !sig_set) {
+            sig_set = true;
+            struct sigaction sa{};
+            sa.sa_handler = bt_sweep_handler;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = SA_NODEFER;   // a thread blocked in a CUDA call must still unwind its own user stack
+            sigaction(SIGUSR1, &sa, nullptr);
+        }
+        if (bt_on) {
+            std::fprintf(f, "  per-thread stacks follow on stderr (=== stall-bt tid=N ===):\n");
+            std::fflush(f);
+            const pid_t self = (pid_t) syscall(SYS_gettid);
+            std::error_code ec2;
+            for (const auto& e : std::filesystem::directory_iterator("/proc/self/task", ec2)) {
+                const pid_t tid = (pid_t) std::atoi(e.path().filename().string().c_str());
+                if (tid <= 0 || tid == self) continue;
+                syscall(SYS_tgkill, (pid_t) getpid(), tid, SIGUSR1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+#endif
+    std::fprintf(f, "  threads (%d total, grouped by name/state/syscall; 16=ioctl 202=futex 7=poll 232=epoll):\n",
+                 total);
+    for (const auto& [k, n] : groups)
+        std::fprintf(f, "    x%-4d \"%s\" %c %s\n", n, k.comm.c_str(), k.state,
+                     k.sc == 16 ? "ioctl" : k.sc == 202 ? "futex" : k.sc == 7 ? "poll" : k.sc == 232 ? "epoll_wait"
+                     : k.sc == 230 ? "clock_nanosleep" : k.sc == 35 ? "nanosleep" : k.sc == -1 ? "running" : "?");
+    if (!hot.empty()) {
+        std::fprintf(f, "  threads burning CPU or stuck in the kernel (the wedge is here):\n");
+        for (const std::string& h : hot) std::fprintf(f, "    %s\n", h.c_str());
+    }
+    prev_cpu = std::move(now_cpu);
+}
+#endif
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
 #if defined(_WIN32)
@@ -1872,6 +1993,7 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
         if (auto fn = strata::core::diag_pipeline_fn().load()) fn(f);
 #if !defined(_WIN32)
         disk_wait_threads(f);
+        if (std::getenv("STRATA_RING_TRACE") != nullptr) thread_forensics(f);
 #endif
         const MemSample m = mem_sample();
         std::fprintf(f, "  memory: %llu MiB resident, %llu MiB %s, %llu MiB RAM available; %llu %s\n", m.rss_mib,
@@ -13043,6 +13165,10 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            static const bool rt_g = std::getenv("STRATA_RING_TRACE") != nullptr;
+            if (rt_g && use_mtp && !batched)
+                std::fprintf(stderr, "strata ring-trace: on_chunk mtp.prefill start p0=%lld T=%lld\n",
+                             (long long) p0, (long long) T);
             if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
 #if defined(STRATA_HAVE_DFLASH2)
             if (use_df2) {
@@ -13051,6 +13177,8 @@ int main(int argc, char** argv) {
                 df2.note_rows(tk.data(), T, p0);
             }
 #endif
+            if (rt_g && use_mtp && !batched)
+                std::fprintf(stderr, "strata ring-trace: on_chunk mtp.prefill done p0=%lld\n", (long long) p0);
             if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
                              batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long) T);

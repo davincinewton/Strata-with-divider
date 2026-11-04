@@ -502,6 +502,12 @@ static bool handoff_pipe_worker() {
     static const bool v = [] { const char* e = std::getenv("STRATA_HANDOFF_PIPE_WORKER"); return !e || std::atoi(e) != 0; }();
     return handoff_pipe_pieces() > 0 && v;
 }
+// STRATA_RING_TRACE: the stall-search probes' gate (prints nothing when unset; default path unchanged)
+static bool ring_trace_on() {
+    static const bool v = std::getenv("STRATA_RING_TRACE") != nullptr;
+    return v;
+}
+
 struct HandWorker {
     std::mutex mu;
     std::condition_variable cv;
@@ -853,7 +859,14 @@ struct Stager {
             issued.notify_all();
 #endif
             for (size_t i = 0; i < ready_cap; ++i) ready[i].store(1, std::memory_order_release);
+            if (ring_trace_on())
+                std::fprintf(stderr, "strata ring-trace: stager start: draining old generation (active=%d)\n",
+                             (int) active.load(std::memory_order_acquire));
+            const auto t_dr0 = std::chrono::steady_clock::now();
             while (active.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+            if (ring_trace_on())
+                std::fprintf(stderr, "strata ring-trace: stager start: drained in %.0f ms\n",
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dr0).count());
             ready_cap = jobs.size() * 2;
             ready.reset(new std::atomic<int>[ready_cap]);
             skipped.reset(new std::atomic<char>[ready_cap]);
@@ -1271,13 +1284,14 @@ struct Prefill::Impl {
     int32_t* ident_table = nullptr;
     cudaStream_t kv_copy = nullptr;
     cudaEvent_t kv_released = nullptr, kv_ready = nullptr;
-    // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
+    // layer split: the device, and the hand-off to the next stage (pinned chunk buffers, used in rotation)
     int device = -1;
-    float* hand[2] = {};
+    float* hand[8] = {};
+    int hand_depth = 2;   // STRATA_HANDOFF_DEPTH: the buffers' count (2 = the historical double buffer)
     // STRATA_HANDOFF_PIPE: per hand-off buffer, "the chunk's work is done" and one "landed" event per piece
     int hand_pieces = 0;
-    cudaEvent_t hand_done[2] = {};
-    cudaEvent_t hand_ev[2][kHandPiecesMax] = {};
+    cudaEvent_t hand_done[8] = {};
+    cudaEvent_t hand_ev[8][kHandPiecesMax] = {};
     std::unique_ptr<HandWorker> hand_worker;   // STRATA_HANDOFF_PIPE: the next stage's chunks' thread (lazily)
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
@@ -1410,11 +1424,13 @@ void Prefill::release() {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
     }
-    for (int b = 0; b < 2; ++b) {
+    for (int b = 0; b < impl_->hand_depth; ++b) {   // the hand-off buffers (STRATA_HANDOFF_DEPTH deep)
         if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
         if (impl_->hand_done[b]) cudaEventDestroy(impl_->hand_done[b]);
         for (cudaEvent_t& e : impl_->hand_ev[b])
             if (e) cudaEventDestroy(e);
+    }
+    for (int b = 0; b < 2; ++b) {   // the PLE double buffer
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
         if (b == 0 && impl_->ple_raw_dev) { (void) cudaFree(impl_->ple_raw_dev); impl_->ple_raw_dev = nullptr; }
@@ -1853,7 +1869,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
-    for (int b = 0; next_ != nullptr && b < 2; ++b)
+    if (next_ != nullptr) {   // STRATA_HANDOFF_DEPTH: the hand-off buffers' count (the 7-stage rows let the head
+        const char* hd = std::getenv("STRATA_HANDOFF_DEPTH");   // outrun the 2-deep history a slow consumer keeps)
+        if (hd) { int v = std::atoi(hd); if (v < 2) v = 2; if (v > 8) v = 8; m.hand_depth = v; }
+    }
+    for (int b = 0; next_ != nullptr && b < m.hand_depth; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
@@ -1861,7 +1881,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (next_ != nullptr && handoff_pipe_pieces() > 0 && m.hand_pieces == 0) {   // events only: no device memory
         bool ok = true;
         auto make = [](cudaEvent_t& e) { return e != nullptr || cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess; };
-        for (int b = 0; b < 2; ++b) {   // (a retry after a failed init keeps the events it made)
+        for (int b = 0; b < m.hand_depth; ++b) {   // (a retry after a failed init keeps the events it made)
             ok = ok && make(m.hand_done[b]);
             for (int i = 0; ok && i < handoff_pipe_pieces(); ++i) ok = make(m.hand_ev[b][i]);
         }
@@ -3322,6 +3342,10 @@ struct KvaTap {
 
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
+    if (ring_trace_on())
+        std::fprintf(stderr, "strata ring-trace: ENTER run_impl stage [%lld,%lld) n=%lld pos0=%lld hand=%d\n",
+                     (long long) stage_lb_, (long long) stage_le_, (long long) n, (long long) pos0,
+                     (int) (hand_in_ != nullptr));
     // force_chunk is for this run only: taken before any early return can leave it to the next one
     const int64_t forced = hand_in_ == nullptr ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
@@ -3408,6 +3432,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const bool pipe_chunked = hand_in_ == nullptr ? (forced > 0 ? forced_planned : planned_C > 0 && C < std::min(n, m.T))
                                                   : pipe_chunked_;
     const bool helped = single_chunk && bind_stage_helper(n);
+    if (ring_trace_on())
+        std::fprintf(stderr, "strata ring-trace: past setup stage [%lld,%lld) helped=%d n=%lld\n",
+                     (long long) LB, (long long) LE, (int) helped, (long long) n);
     if (helped) std::swap(m.pp, m.help_pp);
     struct HelpScope {
         Impl& m;
@@ -3505,6 +3532,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld stage [%lld,%lld) %.1f ms\n", (long long) c0,
                          (long long) n, (long long) stage_lb_, (long long) stage_le_, ms);
+            if (std::getenv("STRATA_RING_TRACE") != nullptr)
+                std::fprintf(stderr, "strata ring-trace: run_impl entered stage [%lld,%lld) c0=%lld n=%lld\n",
+                             (long long) stage_lb_, (long long) stage_le_, (long long) c0, (long long) n);
             std::fflush(stderr);
             tc0 = Clock::now();
             t_stream0 = stats_.experts_streamed;
@@ -6329,7 +6359,45 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {
-            // The current hand-off slot was used two chunks ago.
+            // STRATA_RING_TRACE: a live view of the stage's events when the chunk-end sync hangs - which event
+            // the compute stream is parked on is what the deadlock analysis needs
+            auto dump_ring = [&](const char* where) {
+                auto q = [](cudaEvent_t e) -> const char* {
+                    if (e == nullptr) return "null";
+                    const cudaError_t r = cudaEventQuery(e);
+                    return r == cudaSuccess ? "done" : (r == cudaErrorNotReady ? "PENDING" : "?");
+                };
+                int cop_pend = 0, used_pend = 0, hd_pend = 0, hev_pend = 0, ple_pend = 0;
+                for (int i = 0; i < m.ring; ++i) if (q(m.copied[i]) == std::string("PENDING")) ++cop_pend;
+                for (int i = 0; i < RING_MAX; ++i) if (q(m.used[i]) == std::string("PENDING")) ++used_pend;
+                for (int i = 0; i < m.hand_depth; ++i) if (q(m.hand_done[i]) == std::string("PENDING")) ++hd_pend;
+                for (int i = 0; i < m.hand_depth; ++i) for (int j = 0; j < m.hand_pieces; ++j) if (q(m.hand_ev[i][j]) == std::string("PENDING")) ++hev_pend;
+                for (int i = 0; i < 2; ++i) if (q(m.ple_copied[i]) == std::string("PENDING")) ++ple_pend;
+                const char* csq = cudaStreamQuery(m.cs) == cudaSuccess ? "idle" : "BUSY";
+                const char* cpq = m.copy ? (cudaStreamQuery(m.copy) == cudaSuccess ? "idle" : "BUSY") : "null";
+                std::fprintf(stderr, "strata ring-trace: %s stage [%lld,%lld) ring=%d useq=%u | cs=%s copy=%s | "
+                                     "copied PENDING %d/%d, used PENDING %d/%d, hand_done PENDING %d/2, hand_ev PENDING %d, "
+                                     "ple_copied PENDING %d/2 | issued=%zu consumed=%zu rec=%zu seq=%zu | "
+                                     "copied[0..8]=%s %s %s %s %s %s %s %s %s\n",
+                             where, (long long) stage_lb_, (long long) stage_le_, m.ring, (unsigned) m.useq, csq, cpq,
+                             cop_pend, m.ring, used_pend, RING_MAX, hd_pend, hev_pend, ple_pend,
+                             a_issued.load(std::memory_order_acquire), a_consumed.load(std::memory_order_acquire),
+                             a_rec.load(std::memory_order_acquire), seq.size(),
+                             q(m.copied[0]), m.ring > 1 ? q(m.copied[1]) : "-", m.ring > 2 ? q(m.copied[2]) : "-",
+                             m.ring > 3 ? q(m.copied[3]) : "-", m.ring > 4 ? q(m.copied[4]) : "-", m.ring > 5 ? q(m.copied[5]) : "-",
+                             m.ring > 6 ? q(m.copied[6]) : "-", m.ring > 7 ? q(m.copied[7]) : "-", m.ring > 8 ? q(m.copied[8]) : "-");
+                for (int i = 0; i < m.ring; ++i)
+                    if (q(m.copied[i]) == std::string("PENDING"))
+                        std::fprintf(stderr, "strata ring-trace:   copied[%d] PENDING (slot live=%d used_of=%d)\n",
+                                     i, (int) m.stage_live[i], m.used_of[i]);
+                for (int i = 0; i < RING_MAX && i < 40; ++i)
+                    if (q(m.used[i]) == std::string("PENDING"))
+                        std::fprintf(stderr, "strata ring-trace:   used[%d] PENDING\n", i);
+                for (int i = 0; i < m.hand_depth; ++i) if (q(m.hand_done[i]) == std::string("PENDING"))
+                    std::fprintf(stderr, "strata ring-trace:   hand_done[%d] PENDING\n", i);
+                std::fflush(stderr);
+            };
+            // The current hand-off slot was last used hand_depth chunks ago (2 in the historical double buffer).
             float* h = m.hand[hand_buf_];
             const int hp = m.hand_pieces;
             if (hp > 0) {
@@ -6344,19 +6412,61 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                              cudaMemcpyDeviceToHost, m.cs) == cudaSuccess;
                     ok = ok && cudaEventRecord(m.hand_ev[hand_buf_][i], m.cs) == cudaSuccess;
                 }
-                if (!ok || cudaEventSynchronize(m.hand_done[hand_buf_]) != cudaSuccess) {
+                if (!ok) {
                     err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-            } else if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
-                       cudaStreamSynchronize(m.cs) != cudaSuccess) {
-                err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
+                if (std::getenv("STRATA_RING_TRACE") != nullptr) {
+                    const auto t_sync = Clock::now();
+                    for (;;) {
+                        if (cudaEventQuery(m.hand_done[hand_buf_]) == cudaSuccess) break;
+                        if (std::chrono::duration<double>(Clock::now() - t_sync).count() > 2.5) {
+                            std::fprintf(stderr, "strata ring-trace: handoff sync hanging, dumping events\n");
+                            dump_ring("handoff-sync");
+                            break;
+                        }
+                    }
+                }
+                if (cudaEventSynchronize(m.hand_done[hand_buf_]) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            } else {
+                if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (std::getenv("STRATA_RING_TRACE") != nullptr) {
+                    const auto t_sync = Clock::now();
+                    for (;;) {
+                        if (cudaStreamQuery(m.cs) == cudaSuccess) break;
+                        if (std::chrono::duration<double>(Clock::now() - t_sync).count() > 2.5) {
+                            std::fprintf(stderr, "strata ring-trace: handoff stream-sync hanging, dumping events\n");
+                            dump_ring("handoff-sync");
+                            break;
+                        }
+                    }
+                }
+                const auto t_cs0 = Clock::now();
+                if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (ring_trace_on())
+                    std::fprintf(stderr, "strata ring-trace: handoff cs-sync done stage [%lld,%lld) %.0f ms\n",
+                                 (long long) stage_lb_, (long long) stage_le_,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t_cs0).count());
             }
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
+            if (std::getenv("STRATA_RING_TRACE") != nullptr && next_run_.valid())
+                std::fprintf(stderr, "strata ring-trace: producer stage [%lld,%lld) waits successor's chunk at %lld\n",
+                             (long long) stage_lb_, (long long) stage_le_, (long long) (p0 + T));
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+            if (std::getenv("STRATA_RING_TRACE") != nullptr)
+                std::fprintf(stderr, "strata ring-trace: producer stage [%lld,%lld) got successor's chunk at %lld\n",
+                             (long long) stage_lb_, (long long) stage_le_, (long long) (p0 + T));
             next_err_.clear();
             next_->hand_in_ = h;
             next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
@@ -6370,11 +6480,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     (void) cudaGetLastError();   // clear what a thread's end cleared (std::async)
                     return r;
                 }));
-            } else
-            next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
-                strata::aux_cpus::pin_current_thread();
-                return next_->run_impl(tokens + c0, T, p0, next_err_);
-            });
+            } else {
+                if (ring_trace_on())
+                    std::fprintf(stderr, "strata ring-trace: submitting successor run [%lld,%lld) chunk at %lld\n",
+                                 (long long) next_->stage_lb_, (long long) next_->stage_le_, (long long) (p0 + T));
+                next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+                    if (ring_trace_on())
+                        std::fprintf(stderr, "strata ring-trace: async worker START run [%lld,%lld) c0=%lld\n",
+                                     (long long) next_->stage_lb_, (long long) next_->stage_le_, (long long) c0);
+                    strata::aux_cpus::pin_current_thread();
+                    return next_->run_impl(tokens + c0, T, p0, next_err_);
+                });
+            }
             if (trace_chunk) {
                 std::fprintf(stderr, "strata trace: stage [%lld,%lld) chunk at %lld (%lld tokens) took %.1f ms, "
                                      "%lld experts streamed; handed on\n",
@@ -6383,7 +6500,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              (long long) (stats_.experts_streamed - t_stream0));
                 std::fflush(stderr);
             }
-            hand_buf_ ^= 1;
+            hand_buf_ = (hand_buf_ + 1) % m.hand_depth;   // STRATA_HANDOFF_DEPTH: rotate the hand-off buffers
             continue;   // the last stage reports the chunk (on_chunk)
         }
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
@@ -6429,13 +6546,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 #endif
         if (on_chunk || on_stage_chunk) {
             const auto toc = Clock::now();
+            if (ring_trace_on())
+                std::fprintf(stderr, "strata ring-trace: pre-cb cs-sync start stage [%lld,%lld) p0=%lld\n",
+                             (long long) stage_lb_, (long long) stage_le_, (long long) p0);
             if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
                 err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
+            if (ring_trace_on())
+                std::fprintf(stderr, "strata ring-trace: pre-cb cs-sync done stage [%lld,%lld) p0=%lld %.0f ms\n",
+                             (long long) stage_lb_, (long long) stage_le_, (long long) p0,
+                             std::chrono::duration<double, std::milli>(Clock::now() - toc).count());
             const auto toc2 = Clock::now();
+            if (ring_trace_on() && (on_stage_chunk || on_chunk))
+                std::fprintf(stderr, "strata ring-trace: callbacks start stage [%lld,%lld) p0=%lld\n",
+                             (long long) stage_lb_, (long long) stage_le_, (long long) p0);
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
+            if (ring_trace_on() && (on_stage_chunk || on_chunk))
+                std::fprintf(stderr, "strata ring-trace: callbacks done stage [%lld,%lld) p0=%lld\n",
+                             (long long) stage_lb_, (long long) stage_le_, (long long) p0);
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }
@@ -7983,6 +8113,9 @@ bool Prefill::drain_pipeline(std::string& err) {
     bool ok = true;
 
     if (next_run_.valid()) {
+        if (ring_trace_on())
+            std::fprintf(stderr, "strata ring-trace: drain stage [%lld,%lld) waiting successor\n",
+                         (long long) stage_lb_, (long long) stage_le_);
         if (!next_run_.get()) {
             err = next_err_;
             ok = false;
@@ -7990,6 +8123,9 @@ bool Prefill::drain_pipeline(std::string& err) {
     }
 
     if (next_ != nullptr) {
+        if (ring_trace_on())
+            std::fprintf(stderr, "strata ring-trace: drain stage [%lld,%lld) successor done, draining tail\n",
+                         (long long) stage_lb_, (long long) stage_le_);
         std::string tail_err;
         if (!next_->drain_pipeline(tail_err)) {
             if (ok) err = tail_err;

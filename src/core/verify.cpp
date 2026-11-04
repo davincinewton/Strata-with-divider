@@ -3586,7 +3586,21 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
+        static const bool rt_v = std::getenv("STRATA_RING_TRACE") != nullptr;
+        std::fprintf(stderr, rt_v ? "strata verify-trace: copy-sync start T=%lld\n" : "", (long long) T);
+        const auto t_cv0 = std::chrono::steady_clock::now();
+        int cv_logged = 0;
+        while (rt_v && cudaStreamQuery(copy_) != cudaSuccess) {
+            const double w = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_cv0).count();
+            if (w > 2.5 + cv_logged) {
+                std::fprintf(stderr, "strata verify-trace: copy-sync hanging %.0f s (T=%lld)\n", w, (long long) T);
+                ++cv_logged;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+        if (rt_v)
+            std::fprintf(stderr, "strata verify-trace: copy-sync done T=%lld\n", (long long) T);
         copy_used_ = false;
     }
     if (h_bal_ != nullptr && !all_resident_ && !bal_paused_) pcie_balance_window(steps, G);
