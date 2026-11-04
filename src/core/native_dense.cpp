@@ -531,6 +531,38 @@ bool NativeDense::add_hc_skip(const std::string& pack_dir, std::set<std::string>
     return true;
 }
 
+// M5-P5: the no-table price: same eligibility and range rules as the table version, reading the shapes from the
+// GGUF itself (the table does not exist while the first stage's weights are deferred).
+bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, bool include_ple_key,
+                                   int64_t lb, int64_t le, uint64_t& out, std::string& err) {
+    out = 0;
+    try {
+        std::set<std::string> seen;
+        uint64_t total = 0;
+        for (const auto& path : shards) {
+            strata::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key)) continue;
+                if (tensor.name.rfind("blk.", 0) == 0) {
+                    const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
+                    if (l < lb || l >= le) continue;
+                }
+                if (!seen.insert(tensor.name).second) continue;
+                if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
+                if (tensor.shape.size() != 2 || tensor.shape[0] == 0 || tensor.shape[0] > INT_MAX ||
+                    tensor.shape[1] == 0) continue;
+                total += alloc_bytes(strata::kernels::native_mmvq_weight_bytes(
+                    tensor.type, (int) tensor.shape[0], (int) tensor.shape[1]));
+            }
+        }
+        out = total;
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
 const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int slot, int cls) {
     if (w.data != nullptr) return (const uint16_t*) w.data;
     if (w.hc_q8 == nullptr) return nullptr;

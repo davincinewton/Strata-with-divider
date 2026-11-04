@@ -4528,8 +4528,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
+    // M5-P5: in a late-weights (auto) split CUDA0 does not load its dense weights at boot at all: the split is
+    // unknown yet, and every later stage proves the better order - load after the split.  Nothing on this card
+    // binds weight pointers before the serve-time load (checked: no consumer reads wt/native_dense between the
+    // two points), so nothing a later free could poison, and the search prices the card from bytes never spent.
+    // STRATA_SLOT0_TRIM=0 restores the boot load (then M5-P4's credit rule applies to what serve would free).
+    const bool defer_slot0 = late_weights && [] {
+        const char* e = std::getenv("STRATA_SLOT0_TRIM");
+        return !(e != nullptr && e[0] == '0');
+    }();
     void* arena = nullptr;
-    if (const cudaError_t ce = cudaMalloc(&arena, pool_bytes); ce != cudaSuccess) {
+    if (const cudaError_t ce = defer_slot0 ? cudaSuccess : cudaMalloc(&arena, pool_bytes); ce != cudaSuccess) {
         // #486: the arena is the first large allocation and its size does not depend on the context, so what is
         // missing is held by something else: say how much was free
         cudaGetLastError();
@@ -4575,33 +4584,54 @@ int main(int argc, char** argv) {
         return s;
     };
     strata::core::WeightTable wt;
-    if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (defer_slot0)
+        std::fprintf(stderr, "strata generate: CUDA0's dense weights stay unloaded until the split is known "
+                             "(the first card loads its range at serve, like every stage)\n");
+    else if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
-    if (hc_q8) {
-        uint64_t qb = 0;
-        if (!wt.load_hc_q8(o.pack, qb, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
-        std::fprintf(stderr, "strata generate: STRATA_HC_REQ8: hyper-connection projections as int8 + fp32/32 scales, "
-                             "%llu MiB\n", (unsigned long long) (qb >> 20));
-    }
-    std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s in %.1f s (%zu canonical tensors "
-                         "skipped: served natively)\n",
-                 (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
-    mem_mark("the pack weights");
-
     strata::core::NativeDense native_dense;
-    if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
-            std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
+    if (!defer_slot0) {
+        if (hc_q8) {
+            uint64_t qb = 0;
+            if (!wt.load_hc_q8(o.pack, qb, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+            std::fprintf(stderr, "strata generate: STRATA_HC_REQ8: hyper-connection projections as int8 + fp32/32 scales, "
+                                 "%llu MiB\n", (unsigned long long) (qb >> 20));
+        }
+        std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s in %.1f s (%zu canonical tensors "
+                             "skipped: served natively)\n",
+                     (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
+        mem_mark("the pack weights");
+        if (!o.native_dense_gguf.empty()) {
+            if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+                std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights, in %.1f s\n",
+                         native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
+        }
+    }
+    // M5-P5: CUDA0's whole-net native-projection bytes either way - measured from the card (loaded) or priced from
+    // the GGUF headers (deferred).  The planner works from these numbers, never a priced model.
+    uint64_t slot0_nd_full = 0;
+    if (defer_slot0) {
+        if (!o.native_dense_gguf.empty() &&
+            !strata::core::NativeDense::weight_bytes_for(o.native_dense_gguf, o.native_ple_key, 0, g.n_layers,
+                                                         slot0_nd_full, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights, in %.1f s\n",
-                     native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
-    }
-    // M5-P4: what the whole-net dense (pool + native projections) costs on CUDA0's card - the trim credit and the
-    // serve-time reload both work from these measured bytes, never a priced model.
-    const uint64_t ndense_alloc = native_dense.allocated_bytes();
+    } else
+        slot0_nd_full = native_dense.allocated_bytes();
+    // The search's dense adjustment for CUDA0: deferred = charge the range share the serve load will cost (the
+    // measured free no longer carries the whole net - it was never loaded); loaded at boot = M5-P4's credit.
+    auto slot0_dense_room_adj = [&](int64_t le) -> int64_t {
+        if (!late_weights) return 0;
+        const double full = (double) (pool_bytes + slot0_nd_full);
+        return defer_slot0 ? -(int64_t) (full * (double) le / (double) g.n_layers)
+                           : (int64_t) (full * (double) (g.n_layers - le) / (double) g.n_layers);
+    };
 
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
     strata::kernels::gr_set_native_mmvf(o.gr_native_mmvf);
@@ -4711,6 +4741,11 @@ int main(int argc, char** argv) {
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
     strata::kernels::PleTable ple_table;
+    // M5-P5: with the first card's dense load deferred, the PLE's six weights arrive only at the serve-time
+    // load; the wiring becomes this handle, called there (the sessions init after it - nothing reads these
+    // pointers sooner).  Under the old boot load it runs in place, exactly as before.
+    std::function<bool()> wire_ple;
+    bool ple_pending = false;
     bool ple_lock_by_policy = false;   // the table was locked in RAM by the residency policy (not by --ple-io ram): #4518 may give the lock back
     std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
@@ -4846,6 +4881,7 @@ int main(int argc, char** argv) {
                                  "(STRATA_SSD_KEEPALIVE=0 turns it off)\n", pio.keepalive_ms, pio.keepalive_window_s);
         else if (pio.mode == strata::kernels::PleIo::Direct)
             std::fprintf(stderr, "strata generate: SSD keep-alive off: the SSD may fall asleep between reads\n");
+        wire_ple = [&]() -> bool {
         const strata::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
         const strata::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
         const strata::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
@@ -4855,7 +4891,7 @@ int main(int argc, char** argv) {
         if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
             std::fprintf(stderr, "strata generate: the pack has no blk.1.ple_* tensors, so the PLE cannot be "
                                  "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
-            return 1;
+            return false;
         }
         // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
         // by the sizes the `WeightRef` records rather than re-derived - the same rule `plane_ptrs` follows.
@@ -4870,7 +4906,7 @@ int main(int argc, char** argv) {
             if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 && wk->native_type != 23 &&
                                      wk->native_type != 8) || !wk->native_q8_1) {
                 std::fprintf(stderr, "strata generate: native PLE key is absent or incompatible\n");
-                return 1;
+                return false;
             }
             ss.ple.w.key_native_data = wk->native_data;
             ss.ple.w.key_native_type = wk->native_type;
@@ -4892,7 +4928,7 @@ int main(int argc, char** argv) {
                                  "%llu B for %lld values); the PLE conv1d kernel reads F16 - repack with "
                                  "tools/iq_pack.py\n",
                          (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
-            return 1;
+            return false;
         }
         ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
         ss.ple.consts = strata::kernels::ple_artifact_consts();
@@ -4910,6 +4946,12 @@ int main(int argc, char** argv) {
         }
         ss.ple.emb_dev = ple_emb_dev;
         ss.ple.scratch = ple_scratch;
+        return true;
+        };
+        if (defer_slot0)
+            ple_pending = true;
+        else if (!wire_ple())
+            return 1;
     } else {
         std::fprintf(stderr,
                      "strata generate: PLE OFF by explicit --no-ple diagnostic request.\n"
@@ -5307,7 +5349,14 @@ int main(int argc, char** argv) {
         }
         if (!o.native_dense_gguf.empty()) {
             uint64_t dense = 0;
-            if (!strata::core::NativeDense::weight_bytes_for(o.native_dense_gguf, wt, o.native_ple_key, lb, le, dense, err)) {
+            // M5-P5: with the first card's load deferred the canonical table is not built yet; the no-table price
+            // reads the same GGUF headers and applies the same eligibility and range rules.
+            const bool priced = defer_slot0
+                                    ? strata::core::NativeDense::weight_bytes_for(o.native_dense_gguf,
+                                                                                  o.native_ple_key, lb, le, dense, err)
+                                    : strata::core::NativeDense::weight_bytes_for(o.native_dense_gguf, wt,
+                                                                                  o.native_ple_key, lb, le, dense, err);
+            if (!priced) {
                 carve_ok = false;
                 return 0;
             }
@@ -5370,7 +5419,7 @@ int main(int argc, char** argv) {
             // whose whole pool is 1.4 GiB (boot measured: CUDA0 planned 2 layers, held 517/1024, aborted).
             const int64_t trim_credit =
                 (i == 0 && late_weights)
-                    ? (int64_t)(((double)pool_bytes + (double)ndense_alloc) * (double)(g.n_layers - le) / (double)g.n_layers)
+                    ? slot0_dense_room_adj(le)
                     : 0;
             return cap[(size_t) i] + trim_credit - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) -
                    (i == 0 ? 0 : (int64_t) carve_bytes(lb, le));
@@ -5993,7 +6042,7 @@ int main(int argc, char** argv) {
                 const int64_t pf_delta_mib = split_pf_mib > 0 ? (chunk - chunk_now) * 680 / 1024 : 0;
                 const int64_t trim_credit =
                     (i == 0 && late_weights)
-                        ? (int64_t)(((double)pool_bytes + (double)ndense_alloc) * (double)(g.n_layers - le) / (double)g.n_layers)
+                        ? slot0_dense_room_adj(le)
                         : 0;
                 return cap[(size_t) i] + trim_credit - pf_delta_mib * 1048576 -
                        (int64_t) strata::core::session_bytes(g, ctx, K, 0, le) - (i == 0 ? 0 : (int64_t) carve_bytes(0, le));
@@ -6250,55 +6299,62 @@ int main(int argc, char** argv) {
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
-        // M5-P4 (the slot-0 fix): CUDA0's dense weights reloaded to its OWN range.  The split is unknown at load
-        // time, so CUDA0 carried the whole net's dense (pool 1.4 + native projections 3.5 GiB measured on the 3060
-        // rig) while later stages load only their range after the split (measured 1050 MiB for 2 layers) - a
-        // 12 GB first card lost its expert room to weights it never reads.  `weight_bytes_for` prices the share
-        // host-side from the GGUF headers, so the reload is verified smaller BEFORE anything is freed; the same
-        // `add_foreign` skip rule as `load_stage_weights` carves the pool; the search credited exactly this
-        // release (measured bytes x range share), so the plan and the card now agree.
-        if (late_weights && hi0 > 0 && hi0 < g.n_layers) {
+        // M5-P5: CUDA0 loads its dense weights now that the split is known - the order every later stage uses
+        // (`load_stage_weights`): range share of the pool by the same skip rule, projections by the range set
+        // statically around the load.  Nothing here frees or rebinds anything: the boot load was deferred, so no
+        // consumer ever saw the whole-net pointers.  Under STRATA_SLOT0_TRIM=0 the boot load stands and this
+        // block does nothing.
+        if (defer_slot0 && hi0 > 0 && hi0 < g.n_layers) {
             std::set<std::string> skip0 = skip_base;   // the native-served names, as load_stage_weights does
-            add_foreign(0, hi0, skip0, o.mmap_experts);
-            uint64_t pool0 = 0, nd0 = 0;
-            bool ok = strata::core::WeightTable::pool_bytes(o.pack, pool0, err, &skip0);
-            if (ok && !o.native_dense_gguf.empty())
-                ok = strata::core::NativeDense::weight_bytes_for(o.native_dense_gguf, wt, o.native_ple_key, 0, hi0,
-                                                                 nd0, err);
-            if (!ok) {
-                std::fprintf(stderr, "strata generate: CUDA0 dense trim: %s\n", err.c_str());
+            add_foreign(0, hi0, skip0, false);
+            // the PLE module is a layer-1 module the whole engine reads through CUDA0's copy (the old boot-load
+            // behavior), so its five pack-stored weights ride this card's arena even when layer 1 is not in the
+            // range.  `blk.1.ple_key.weight` stays skipped: it exists only in the native GGUF and the projections
+            // load below registers it in the table, exactly as the boot load did.
+            for (const char* n : {"blk.1.ple_value.weight", "blk.1.ple_norm_key.weight",
+                                  "blk.1.ple_norm_query.weight", "blk.1.ple_norm_conv.weight",
+                                  "blk.1.ple_conv1d.weight"})
+                skip0.erase(n);
+            uint64_t pool0 = 0;
+            if (!strata::core::WeightTable::pool_bytes(o.pack, pool0, err, &skip0)) {
+                std::fprintf(stderr, "strata generate: CUDA0 dense load: %s\n", err.c_str());
                 return 1;
             }
-            const int64_t back = (int64_t) (pool_bytes + ndense_alloc) - (int64_t) (pool0 + nd0);
-            if (back > (int64_t) (128u << 20) && pool0 <= pool_bytes && nd0 <= ndense_alloc) {
-                cudaFree(arena);
-                arena = nullptr;
-                wt.~WeightTable();
-                new (&wt) strata::core::WeightTable();
-                native_dense.~NativeDense();
-                new (&native_dense) strata::core::NativeDense();
-                uint64_t hc_re = 0;
-                strata::core::NativeDense::set_layer_range(0, (int) hi0);
-                const bool loaded = cudaMalloc(&arena, pool0) == cudaSuccess &&
-                                    wt.load(o.pack, arena, pool0, err, skip0.empty() ? nullptr : &skip0) &&
-                                    (!hc_q8 || wt.load_hc_q8(o.pack, hc_re, err)) &&
-                                    (o.native_dense_gguf.empty() ||
-                                     native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0, hi0));
-                strata::core::NativeDense::set_layer_range(-1, -1);
-                if (!loaded) {
-                    std::fprintf(stderr, "strata generate: CUDA0 dense trim: the range reload failed (%s)\n",
-                                 err.c_str());
-                    return 1;
-                }
-                size_t fb0 = 0, tb0 = 0;
-                cudaMemGetInfo(&fb0, &tb0);
-                std::fprintf(stderr, "strata generate: CUDA0 dense weights trimmed to layers 0-%lld: arena %llu -> "
-                                     "%llu MiB, projections %llu -> %llu MiB; %.2f GiB back, %.2f GiB free\n",
-                             (long long) (hi0 - 1), (unsigned long long) (pool_bytes >> 20),
-                             (unsigned long long) (pool0 >> 20), (unsigned long long) (ndense_alloc >> 20),
-                             (unsigned long long) (nd0 >> 20), (double) back / 1073741824.0,
-                             (double) fb0 / 1073741824.0);
+            size_t fb0 = 0, tb0 = 0;
+            cudaMemGetInfo(&fb0, &tb0);
+            const int64_t want = (int64_t) pool0 +
+                                 (int64_t) ((double) slot0_nd_full * (double) hi0 / (double) g.n_layers);
+            if ((int64_t) fb0 < want + (int64_t) (256u << 20)) {
+                std::fprintf(stderr, "strata generate: CUDA0 dense load: the card has %zu GiB free and the range "
+                                     "needs ~%zu MiB plus the buffers of the stage - the plan does not fit\n",
+                             (size_t) (fb0 >> 30), (size_t) (want >> 20));
+                return 1;
             }
+            const auto d0 = std::chrono::steady_clock::now();
+            strata::core::NativeDense::set_layer_range(0, (int) hi0);
+            const bool loaded =
+                (arena != nullptr || cudaMalloc(&arena, pool0) == cudaSuccess) &&
+                wt.load(o.pack, arena, pool0, err, skip0.empty() ? nullptr : &skip0) &&
+                (o.native_dense_gguf.empty() ||
+                 native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0, hi0));
+            strata::core::NativeDense::set_layer_range(-1, -1);
+            if (!loaded) {
+                std::fprintf(stderr, "strata generate: CUDA0 dense load: the range load failed (%s)\n", err.c_str());
+                return 1;
+            }
+            if (ple_pending) {
+                if (!wire_ple())
+                    return 1;
+                ple_pending = false;
+            }
+            size_t fb1 = 0, tb1 = 0;
+            cudaMemGetInfo(&fb1, &tb1);
+            std::fprintf(stderr, "strata generate: CUDA0 dense weights loaded for layers 0-%lld: arena %llu MiB + "
+                                 "projections %llu MiB in %.1f s, %.2f GiB free\n",
+                         (long long) (hi0 - 1), (unsigned long long) (pool0 >> 20),
+                         (unsigned long long) (native_dense.allocated_bytes() >> 20),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - d0).count(),
+                         (double) fb1 / 1073741824.0);
         }
         // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
