@@ -620,6 +620,76 @@ prompt, CUDA0 still 1-layer); an illegal access in the tail chunk's copies (meas
 (measured) - so the cluster pre-dates P4, but P4 is not yet exonerated for the small-request
 variant; the rig could not be benched past it.  Next: trace verify.cpp:3344's copy queue.
 
+## 11.13 M5-P5: the first card loads after the split (the reload was the poison)
+
+M5-P4's serve-time reload of CUDA0's dense weights broke decode on every request (measured: the
+first four-token request hit `verify: an illegal memory access` post-P4 and hung under CUDA_LAUNCH_
+BLOCKING with no faulting op - a spin flag never met, not an access - while the SAME binary with
+the reload path absent, an explicit split at the identical topology, decoded cleanly: `42.1% decode
+cache hits, 13.9 tok/s`).  The reload itself is the difference; the consumer whose boot-time
+pointers it poisoned was never identified and no longer matters: the correct design does not
+free-and-reload at all, it defers.
+
+M5-P5 makes CUDA0 load its dense weights the way every later stage already does - after the split
+is known, its own range only, no destroy step, no pointers to stale.  The boot load is skipped
+under `late_weights` (auto + trim; `STRATA_SLOT0_TRIM=0` restores the old behavior byte-for-byte);
+the arena is allocated at serve from the range share (`add_foreign` skip rule), and the
+projections load with `set_layer_range(0, hi0)` around it.  The search prices the card from bytes
+that were never spent: the pool price from the pack headers (already measured) plus a new
+no-table `NativeDense::weight_bytes_for` that prices the projections from the GGUF shapes (the
+canonical table does not exist while the weights are deferred; the load re-runs every check that
+matters).  The planner arithmetic is unchanged in effect: deferred mode charges `-full x n/48`
+against a free that no longer carries the whole net; the credit mode (TRIM=0) keeps M5-P4's
+`+full x (48-n)/48`.  Measured on the 6x3060+2080Ti fleet at 262K/chunk 4096: TBD-boot.
+
+The defect cluster of 11.12 (its two pre-P4 symptoms: the expert-copy wait after a long prompt and
+the illegal access in the tail chunk) stays open and is re-tested against this build by the same
+bench that benches pp.
+
+## 11.14 the 7-stage prompt-pipeline deadlock - root cause and fix (verification pending)
+
+Measured: a ~18.7k-token prompt froze the compliant 7-stage fleet with every stage idle (60 s
+watchdog, no fault); the stall was deterministic per prompt routing (entries ~16100/16227 of the
+stalled run; STRATA_PREFILL_RING 96->256 moved but did not clear it; STRATA_PREFILL_GROUP_GATHER=0
+turned the same fault into a `copy_i32` illegal access ~23 s in). Decode and short prompts were
+never affected (19.0 tok/s measured, 11.13).
+
+Two code defects, both measured against the running fleet:
+
+1. **Release markers shared an event per slot, not per flush.** `m.used[]` was indexed by ring
+   slot, recorded by two walks that share slots - the MMQ group-gather flush (gated) and the
+   expert-kernel consume loop (`used[kk % ring]` at consume boundaries, ungated, so its host-side
+   records run ahead). The issuer captures `used[used_of[slot]]` at copy-issue time; a capture
+   then held a record of a flush that sits BEHIND the compute stream's own blocked wait - the copy
+   waits for a release that can only fire after the copy. A cycle, in the sense the llama.cpp
+   layer-split design avoids (one fresh event per fact, waits one-directional; ggml-cuda's
+   `cudaEventRecord(src) + cudaStreamWaitEvent(dst)` per hand-off). Fix: a per-flush event pool
+   (`m.useq++ % RING_MAX`, 1024 events, all record sites converted) - a captured event is the
+   marker of exactly one flush, so its stream position is ordered before any later capture.
+2. **Stager generation UAF.** `Stager::start()` grew `ready[]`/`skipped[]`/`jobs` while a previous
+   generation's threads could still be inside `work()` (the threaded walk ends a run without
+   `finish()`; `StagerDone` is a no-op there). A worker reading `ready` from freed memory = an
+   issuer stuck forever on a job; a stale `ready=1` = an unwritten pinned buffer DMA'd (the
+   `copy_i32` IMA face). Fix: `start()` retires the old generation (stop claims, watermark, drain
+   `active`) before growing.
+
+`STRATA_RING_TRACE=1` (opt-in, added this session) gives the issuer/compute join points and
+stall counters used above. **Status: both fixes are committed (compile-clean); the one-boot
+verification and the 262K/chunk-4096 pp bench are pending a GPU reset** - the box is currently
+down at the driver level, see 11.15.
+
+## 11.15 environment: GPU7 stuck at reset (measured)
+
+While the 11.14 fix was being verified, the whole CUDA runtime on the box went dark
+(`cudaGetDeviceCount() = 0`, `unknown error` on malloc and pin) although nvidia-smi and nvtop
+still answered. Measured state: syslog `NVRM: Xid (PCI:0000:0f:00): 119 ... Timeout after 33s of
+waiting for RPC response from GPU7 GSP` at 12:19 (during the last repro run), and nvidia-smi now
+reports GPU7 as `[GPU requires reset]`; opening `/dev/nvidia-uvm` returns EIO, which poisons the
+UVM pool for every device, so the runtime enumerates zero GPUs even with GPU7 excluded via
+`CUDA_VISIBLE_DEVICES`. NVML does not use the UVM pool, which is why nvtop/nvidia-smi still work.
+Recovery needs a root-level GPU reset or a reboot (this account has neither); after that, the
+pending verification boot and pp bench (11.14) are the next actions.
+
 ## 12. Milestones
 1. **M0A:** SSD-truth config green **on this rig** with Q6_K_XL (≤10% decode loss). Gate.
 2. **M0B:** divider physics green on a fleet rig (needs ≥20 GB weak card(s)).
