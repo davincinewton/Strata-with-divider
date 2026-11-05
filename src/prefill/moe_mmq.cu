@@ -470,6 +470,23 @@ Context::Context() {
 }
 Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
 
+// [6DIVIDER-OOB] Per-GEMM geometry trace (STRATA_MMQ_TRACE=2).  Prints the exact mmq_args the kernel is given so a
+// faulting launch can be diffed against the allocation: total_rows vs max_rows, ld_dst, the weight shape, the expert
+// stride, and the xq/dst pointer alignment.  This is the single choke point every MMQ GEMM passes through.
+static void mmq_run_trace(const Product& p, ggml_type t, int64_t qk, int64_t bpr) {
+    static const int lvl = [] { const char* e = std::getenv("STRATA_MMQ_TRACE"); return e ? std::atoi(e) : 0; }();
+    if (lvl < 2) return;
+    static int n = 0;
+    if (n++ < 4096)
+        std::fprintf(stderr,
+            "[6DIV-OOB] run#%d type=%s n=%d total_rows=%lld max_rows=%lld ld_dst=%lld w_rows=%lld w_cols=%lld "
+            "expert_bytes=%lld bpr=%lld qk=%lld xq=%p dst=%p w=%p (xq%%16=%llu dst%%16=%llu)\n",
+            n, type_label((int) t), p.n, (long long) p.total_rows, (long long) p.max_rows, (long long) p.ld_dst,
+            (long long) p.w_rows, (long long) p.w_cols, (long long) p.expert_bytes, (long long) bpr, (long long) qk,
+            (const void*) p.xq, (const void*) p.dst, (const void*) p.w,
+            (unsigned long long) ((uintptr_t) p.xq % 16), (unsigned long long) ((uintptr_t) p.dst % 16));
+    std::fflush(stderr);
+}
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
 #if !defined(GGML_USE_HIP)
@@ -485,6 +502,7 @@ void Context::run(const Product& p, void* stream) {
 #endif
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = type_blck((int) t), bpr = p.w_cols / qk;
+    mmq_run_trace(p, t, qk, bpr);
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, p.tab ? 0 : (int64_t) (p.expert_bytes / type_bytes((int) t)), 0, 0,

@@ -1717,17 +1717,53 @@ bool fused_layout(size_t T, bool src) {
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
 // default): MMQ's, for T tokens.
 struct MoeBufs { size_t gu, h, xq, hq; };
+
+// [6DIVIDER-OOB] The MMQ kernel (mul_mat_q) loads full J-wide token tiles; the q8_1 operand must therefore be
+// allocated for the token count rounded UP to the tile granularity, not the exact count, or the final partial
+// tile reads past the end (the 6-divider Q6_K Xid-13 root cause).  STRATA_MMQ_PAD=0 restores the old exact size.
+static size_t mmq_pad_rows(int64_t rows) {
+    static const int64_t on = [] { const char* e = std::getenv("STRATA_MMQ_PAD"); return e == nullptr || e[0] != '0'; }();
+    if (!on) return (size_t) rows;
+    constexpr int64_t G = 128;                       // tile-granularity rows (>= J=96; q8_1_mmq block = 128 elems)
+    return (size_t) ((rows + G - 1) / G * G);
+}
+// [6DIVIDER-OOB] Log the operand geometry that the OOB hunt depends on.  Gated by STRATA_MMQ_TRACE (1 = per size,
+// 2 = also per GEMM launch).  Prints the exact allocation, the token count, the residual vs the tile granularity,
+// and the headroom in bytes so a re-run can be diffed without a fleet boot.
+static void mmq_trace(const char* tag, size_t T, int64_t n_expert, bool fused, size_t ts, size_t xq, size_t hq,
+                      size_t xq_raw, size_t hq_raw) {
+    static const int lvl = [] { const char* e = std::getenv("STRATA_MMQ_TRACE"); return e ? std::atoi(e) : 0; }();
+    if (lvl < 1) return;
+    constexpr int64_t G = 128;
+    std::fprintf(stderr,
+        "[6DIV-OOB] %s: T=%zu n_expert=%lld fused=%d stream_min=%lld ts=%zu "
+        "xq_alloc=%zu xq_raw=%zu (pad=%zu) hq_alloc=%zu hq_raw=%zu (pad=%zu) "
+        "ts_rows=%zu ts%%G=%zu ts*G_headroom_bytes=%zu\n",
+        tag, T, (long long) n_expert, (int) fused, (long long) stream_all_min(), ts,
+        xq, xq_raw, xq - xq_raw, hq, hq_raw, hq - hq_raw,
+        ts, (size_t) (ts % G), (size_t) ((G - ts % G) * K * 2560));
+    std::fflush(stderr);
+}
 MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
     if (!fused && pf_group_scratch()) {   // GU, H, Hq: one group's rows (Xq keeps every row: gate/up reads the layer's)
         const size_t gc = (size_t) group_cap_rows(T, n_expert);
         return {gc * 1280, gc * 640, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) gc, 640)};
     }
-    if (!fused) return {T * K * 1280, T * K * 640, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), 640)};
+    if (!fused) {
+        const size_t xq = mmq::q8_bytes((int64_t) mmq_pad_rows(T * K), N);
+        const size_t hq = mmq::q8_bytes((int64_t) mmq_pad_rows(T * K), 640);
+        mmq_trace("moe_bufs", T, n_expert, fused, T, xq, hq, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), 640));
+        return {T * K * 1280, T * K * 640, xq, hq};
+    }
     const size_t ts = (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);   // MMQ's last small chunk
+    const size_t xq_raw = mmq::q8_bytes((int64_t) (ts * K), N);
+    const size_t hq_raw = mmq::q8_bytes((int64_t) (ts * K), 640);
+    const size_t xq = std::max(mmq::q8_bytes((int64_t) mmq_pad_rows(ts * K), N), fused::act_bytes((int64_t) T, N));
+    const size_t hq = mmq::q8_bytes((int64_t) mmq_pad_rows(ts * K), 640);
+    mmq_trace("moe_bufs", T, n_expert, fused, ts, xq, hq, xq_raw, hq_raw);
     return {std::max<size_t>(ts * K * 1280, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
             std::max<size_t>(ts * K * 640, (fused::act_bytes((int64_t) (T * K), 640) + 3) / 4),
-            std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),
-            mmq::q8_bytes((int64_t) (ts * K), 640)};
+            xq, hq};
 }
 uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
     const MmqPlan& mp = mmq_plan();
