@@ -1456,7 +1456,7 @@ void drive_pool_multi_invariant(void* u, const float* x, const int32_t* ids, int
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
 /// cache and the PCIe share the pool uses for a layer are those of the stage that runs it.
 struct SplitDrive {
-    static constexpr int kMax = 8;
+    static constexpr int kMax = 13;               // 12 dividers + Main (was 8)
     Drive* base = nullptr;
     int n = 0;                                    ///< stages
     int64_t end[kMax] = {};                       ///< stage i runs the layers from end[i - 1] (0) below end[i]
@@ -4228,6 +4228,12 @@ int main(int argc, char** argv) {
                 for (size_t j = 0; ok && j < i; ++j) ok = split_devs[i] != split_devs[j];
             }
         }
+        if (split_devs.size() >= (size_t) SplitDrive::kMax) {   // more than 12 dividers is beyond the split drive
+            std::fprintf(stderr, "strata generate: --layer-split: at most %zu dividers (plus the head) are supported; "
+                                 "this fleet asks for %zu.  Use fewer --gpu cards or a smaller --layer-split list.\n",
+                         (size_t) SplitDrive::kMax - 1, split_devs.size());
+            return 2;
+        }
         if (!ok) {
             std::fprintf(stderr, "strata generate: --layer-split K[,K2..]|auto needs --serve, rising K from 2, and one "
                                  "distinct GPU per K in --split-device (1..%d; or 0 with one K: the same GPU). K is the "
@@ -6208,6 +6214,10 @@ int main(int argc, char** argv) {
         const char* v = std::getenv("STRATA_PROMPT_COST_MAIN");
         return v != nullptr && v[0] == '1';
     }();
+    // pp-first (M5-P2): the divider promise is a HARD constraint, not the decode-window objective.  Read here (above
+    // `stage_room` so the prompt-buffer honesty below sees it) and used by the fills' slack and the placement.  Off
+    // by default -> the decode path stays byte-identical.
+    bool split_pp = [] { const char* v = std::getenv("STRATA_SPLIT_PP"); return v != nullptr && v[0] == '1'; }();
     auto stage_room = [&](int dev, bool later, bool drafter, bool search = false) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
@@ -6222,7 +6232,9 @@ int main(int argc, char** argv) {
         // Under STRATA_PROMPT_COST_MAIN the search must be as honest as serve: the old `search -> 0` optimism
         // (sized as the borrowing configuration) let the pp-first solver promise 9 layers to a card that
         // serve then shaved to 4079/4608 pairs (measured: the warning line, 29.8 GB of x1 re-stream, pp 260).
-        const int64_t pf = (search && split_own_auto && !place_with_reserve && !pf_main_only)
+        // Under pp the prompt buffers (--prefill, the first-priority chunk) are ALWAYS charged honestly: `!split_pp`
+        // turns the search-time optimism off, so a promised placement reserves its real chunk (no serve-time shrink).
+        const int64_t pf = (search && !split_pp && split_own_auto && !place_with_reserve && !pf_main_only)
                                ? 0
                                : (pf_main_only && multi_gpu && !drafter) ? (split_pf_mib - split_ring_mib)
                                : split_pf_mib;
@@ -6244,6 +6256,7 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int ns = (int) stages.size() + 1;
         std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
+        // (split_pp is read above, before stage_room, so the prompt-buffer honesty and the slack both see it.)
         // what stage i has left for experts if it runs [lb, le): its room, minus its session and (a later stage) its weights
         auto stage_left = [&](int i, int64_t lb, int64_t le) -> int64_t {
             // CUDA0 holds its FULL dense table while the search runs; STAGE_TRIM frees everything beyond its
@@ -6349,6 +6362,17 @@ int main(int argc, char** argv) {
             return native_pack ? strata::core::ExpertCache::slot_stride((int64_t) nib::slot_bytes(l), slot_guard)
                                : (int64_t) lay.max_blob;
         };
+        // M5-P6: the >=5-stage capacity-greedy reserves honesty slack before it promises a divider its whole pair
+        // set - 3% on the expert bytes plus 256 MiB and 0.2 GiB/layer for slot guards, allocator granularity and
+        // the dense carve this model measures ~0.19 GiB/layer UNDER-priced ("priced 580 took 1418").  The <=4
+        // fills had NONE of it, so a pp fleet could promise pairs serve then shaved to a fraction -> the honest
+        // verifier self-rejected the plan ("priced too optimistically / NOTHING SERVED") even where a smaller
+        // per-divider load was feasible.  Apply the SAME slack here, pp-only, so a promised plan survives serve.
+        const double kPpSlackPct = 1.03;
+        auto pp_slack_bytes = [](int64_t nl) -> int64_t {
+            return (int64_t) (268435456.0 + 209715200.0 * (double) nl);   // 256 MiB + 0.2 GiB per layer
+        };
+        auto pp_is_divider = [&](int i) -> bool { return split_pp && i + 1 < ns; };   // every stage but Main
         // the predicted window time (ms) of a placement, and the routed mass its caches hold
         std::vector<int64_t> held_cnt((size_t) ns, 0);   // per-stage fill count, for the startability gate
         const int64_t kAutoLendPct = [] {
@@ -6365,7 +6389,8 @@ int main(int argc, char** argv) {
             for (int i = 0; i < ns; ++i) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
                 const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
-                capr[(size_t) i] = stage_left(i, lb, le);
+                // pp: reserve the honesty slack for a divider so what this fill promises is what serve can hold
+                capr[(size_t) i] = stage_left(i, lb, le) - (pp_is_divider(i) ? pp_slack_bytes(le - lb) : 0);
             }
             std::fill(used.begin(), used.end(), 0);
             std::fill(held_cnt.begin(), held_cnt.end(), 0);
@@ -6379,8 +6404,9 @@ int main(int argc, char** argv) {
                 while (st + 1 < ns && l >= at[(size_t) st]) ++st;
                 mass_i[(size_t) st] += mass[r];
                 if (full[(size_t) st]) continue;
-                if (used[(size_t) st] + cost(l) > capr[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
-                used[(size_t) st] += cost(l);
+                const int64_t add = pp_is_divider(st) ? (int64_t) ((double) cost(l) * kPpSlackPct) : cost(l);
+                if (used[(size_t) st] + add > capr[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
+                used[(size_t) st] += add;
                 held_mass += mass[r];
                 held_i[(size_t) st] += mass[r];
                 ++held;
@@ -6424,8 +6450,8 @@ int main(int argc, char** argv) {
         // Main's per-chunk compute and the chunk-arrival interval: a starved x1 stage is the only way Main
         // starves), and a tie prefers fewer layers on Main (its prompt-byte term rides on top of compute).
         // The decode window's time is still computed and printed, never a veto.  Off by default
-        // (byte-identical).  The four-way branch scores its placements inline and is not retargeted here.
-        bool split_pp = [] { const char* v = std::getenv("STRATA_SPLIT_PP"); return v != nullptr && v[0] == '1'; }();
+        // (byte-identical).  Under pp the enumeration is skipped entirely and the capacity-greedy is the sole placer.
+        // (split_pp is read above, before the fills, so the honesty slack below sees it.)
         std::vector<int64_t> pairs_L((size_t) g.n_layers, 0);
         double pp_main_ms = 0;      // the winning placement's Main chunk time (compute + streamed sweep)
         double pp_sweep_gib = 0;    // ... and its streamed GiB per chunk, for the boot line
@@ -6554,6 +6580,51 @@ int main(int argc, char** argv) {
         // #1428: 2 and 3 GPUs - every placement priced, kept (a few hundred) so the near-tie warning below can name the
         // best placement that is really a different one (not the neighbour one layer over)
         std::vector<std::pair<double, std::vector<int64_t>>> priced;
+        // The pp pipeline beat (ms) of a placement, given each stage's held-pair count, or false if some divider
+        // cannot hold its WHOLE profiled pair set (the promise).  Factored out so the `consider` path (ns 2/3 and
+        // the >=5 greedy) and the memoised ns==4 search score a placement on IDENTICAL pp arithmetic.  Also sets
+        // pp_main_ms / pp_sweep_gib for the boot line, exactly as the inline block did.
+        auto pp_time_of = [&](const std::vector<int64_t>& cuts, const std::vector<int64_t>& hc,
+                              double& pp_ms_out, int64_t& main_l_out) -> bool {
+            // every non-Main stage must hold its range's whole profiled pair set (the fill says what fits;
+            // anything short would re-stream over that stage's link during a prompt)
+            for (int i = 0; i + 1 < ns; ++i) {
+                const int64_t lb = i == 0 ? 0 : cuts[(size_t) i - 1], le = cuts[(size_t) i];
+                int64_t want = 0;
+                for (int64_t l = lb; l < le; ++l) want += pairs_L[(size_t) l];
+                if (hc[(size_t) i] < want) return false;
+            }
+            // pp time (M5-P2b, DIVIDER-PLAN 11.10): dividers hold everything and their prompt bytes are the
+            // hand-off - compute only.  Main pays its compute PLUS one streamed sweep of its layers' non-held
+            // pairs per chunk at its measured link: the sweep, not the compute, caps pp when Main carries too
+            // many layers for the slots it has left.
+            double pp_ms = 0;
+            for (int i = 0; i + 1 < ns; ++i) {
+                const int64_t lb = i == 0 ? 0 : cuts[(size_t) i - 1], le = cuts[(size_t) i];
+                pp_ms = std::max(pp_ms, layer_ms[(size_t) i] * (double) (le - lb));
+            }
+            const int64_t m_lb = cuts[(size_t) ns - 2];
+            const int64_t m_l = g.n_layers - m_lb;
+            double main_ms = layer_ms[(size_t) ns - 1] * (double) m_l;
+            double sweep_bytes = 0;
+            int64_t m_pairs = 0;
+            for (int64_t l = m_lb; l < g.n_layers; ++l) {
+                m_pairs += pairs_L[(size_t) l];
+                sweep_bytes += (double) pairs_L[(size_t) l] * (double) cost(l);
+            }
+            const int64_t held_m = hc[(size_t) ns - 1];
+            if (m_pairs > 0)
+                sweep_bytes *= (double) (m_pairs - std::min(held_m, m_pairs)) / (double) m_pairs;
+            const double bw = link_gbps[(size_t) ns - 1];
+            if (bw > 0.0)
+                main_ms += sweep_bytes / (1e6 * bw);   // GB/s -> ms per chunk at this chunk size
+            pp_ms = std::max(pp_ms, main_ms);
+            pp_main_ms = main_ms;
+            pp_sweep_gib = sweep_bytes / 1073741824.0;
+            pp_ms_out = pp_ms;
+            main_l_out = m_l;
+            return true;
+        };
         auto consider = [&]() {
             if (min_stage_layers > 1 && strata::program::split_rules::smallest_stage(at, g.n_layers) < min_stage_layers)
                 return;
@@ -6566,45 +6637,9 @@ int main(int argc, char** argv) {
             if (ns <= 3) priced.emplace_back(ms, at);
             const double mx = stage_max(at);
             if (split_pp) {
-                // every non-Main stage must hold its range's whole profiled pair set (the fill `predict` ran
-                // says what fits; anything short would re-stream over that stage's link during a prompt)
-                for (int i = 0; i + 1 < ns; ++i) {
-                    const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
-                    int64_t want = 0;
-                    for (int64_t l = lb; l < le; ++l) want += pairs_L[(size_t) l];
-                    if (held_cnt[(size_t) i] < want) return;
-                }
-                // pp time (M5-P2b, DIVIDER-PLAN 11.10): dividers hold everything and their prompt bytes are
-                // the hand-off - compute only.  Main pays its compute PLUS one streamed sweep of its layers'
-                // non-held pairs per chunk at its measured link: the sweep, not the compute, is what caps pp
-                // when Main carries too many layers for the slots it has left (tonight: 17.5k blobs per 8192
-                // chunk, 7.6 s/chunk, pp 668 - the same split at 512 chunks swept 4x per token-time, pp 130).
                 double pp_ms = 0;
-                for (int i = 0; i + 1 < ns; ++i) {
-                    const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = at[(size_t) i];
-                    pp_ms = std::max(pp_ms, layer_ms[(size_t) i] * (double) (le - lb));
-                }
-                {
-                    const int64_t m_lb = at[(size_t) ns - 2];
-                    const int64_t m_l = g.n_layers - m_lb;
-                    double main_ms = layer_ms[(size_t) ns - 1] * (double) m_l;
-                    double sweep_bytes = 0;
-                    int64_t m_pairs = 0;
-                    for (int64_t l = m_lb; l < g.n_layers; ++l) {
-                        m_pairs += pairs_L[(size_t) l];
-                        sweep_bytes += (double) pairs_L[(size_t) l] * (double) cost(l);
-                    }
-                    const int64_t held_m = held_cnt[(size_t) ns - 1];
-                    if (m_pairs > 0)
-                        sweep_bytes *= (double) (m_pairs - std::min(held_m, m_pairs)) / (double) m_pairs;
-                    const double bw = link_gbps[(size_t) ns - 1];
-                    if (bw > 0.0)
-                        main_ms += sweep_bytes / (1e6 * bw);   // GB/s -> ms per chunk at this chunk size
-                    pp_ms = std::max(pp_ms, main_ms);
-                    pp_main_ms = main_ms;
-                    pp_sweep_gib = sweep_bytes / 1073741824.0;
-                }
-                const int64_t main_l = g.n_layers - at[(size_t) ns - 2];
+                int64_t main_l = 0;
+                if (!pp_time_of(at, held_cnt, pp_ms, main_l)) return;   // a divider cannot keep the promise
                 const int64_t best_main = best.empty() ? g.n_layers + 1 : g.n_layers - best[(size_t) ns - 2];
                 if (pp_ms < best_max - tie_eps || (pp_ms <= best_max + tie_eps && main_l < best_main)) {
                     if (gate_on && !can_start(parts_of(at))) return;
@@ -6671,15 +6706,16 @@ int main(int argc, char** argv) {
             auto range_hold = [&](int i, int64_t lb, int64_t le) -> size_t {
                 const size_t key = ((size_t) i * (size_t) L + (size_t) lb) * stride + (size_t) le;
                 if (held_mass_at[key] < 0.0) {
-                    // one stage's own carve, exactly as `predict` prices it
-                    const int64_t room = stage_left(i, lb, le);
+                    // one stage's own carve, exactly as `predict` prices it (pp: with the same honesty slack)
+                    const int64_t room = stage_left(i, lb, le) - (pp_is_divider(i) ? pp_slack_bytes(le - lb) : 0);
                     double hm = 0;
                     int64_t used = 0, cnt = 0;
                     for (size_t r = 0; r < profile.size(); ++r) {
                         const int64_t l = profile[r].first;
                         if (l < lb || l >= le) continue;
-                        if (used + cost(l) > room) break;   // the fill stops exactly where predict's does
-                        used += cost(l);
+                        const int64_t add = pp_is_divider(i) ? (int64_t) ((double) cost(l) * kPpSlackPct) : cost(l);
+                        if (used + add > room) break;   // the fill stops exactly where predict's does
+                        used += add;
                         hm += mass[r];
                         ++cnt;
                     }
@@ -6703,6 +6739,8 @@ int main(int argc, char** argv) {
                             strata::program::split_rules::smallest_stage({k1, k2, k3}, L) < min_stage_layers) continue;
                         if (!stage_floors.empty() && strata::program::split_rules::below_floors({k1, k2, k3}, L, stage_floors)) continue;
                         ++tried;
+                        // (No pp path here: under pp the enumeration is not run at all - the capacity-greedy below
+                        //  is the sole placer for every stage count, so this four-way branch is decode-only.)
                         const double mx = stage_max({k1, k2, k3});
                         if (!(ms < best_ms - tie_eps || (ms <= best_ms + tie_eps && mx < best_max - tie_eps))) continue;
                         if (gate_on) {   // the same startability gate as `consider`, over the memoised fills
@@ -6734,7 +6772,9 @@ int main(int argc, char** argv) {
             proportional();
         }
         };
-        search();
+        // In pp mode the capacity-greedy below is the SOLE placer (a pp placement is capacity arithmetic, not a
+        // search, and works for any stage count) - the enumeration is for the decode objective only.
+        if (!split_pp) search();
         // ---- #1616: a stage with one or two layers holds a handful of expert slots (a 12 GB 3060: 512), and the
         // prompt chunk of every card is clamped to what the smallest cache can lend.  When the pick has such a
         // stage, look again among placements that give every stage at least kMinStageLayers layers; keep the new
@@ -6797,11 +6837,12 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        // M5-P3: stage counts beyond the enumeration's reach (five or more).  A pp placement there is capacity
-        // arithmetic, not a search: every divider that can hold its layers' WHOLE pair set takes them, Main takes
-        // the rest, and the max-time shaving keeps one slow divider from becoming the chain's beat.  consider()
-        // still verifies the real ranges, prices the sweep, and is the only thing that can commit the split.
-        if (split_pp && best.empty() && ns >= 5) {
+        // M5-P3 (now the sole pp placer, for ANY stage count): a pp placement is capacity arithmetic, not a search.
+        // Every divider that can hold its layers' WHOLE pair set takes them, Main takes the rest, and the max-time
+        // shaving keeps one slow divider from becoming the chain's beat.  consider() still verifies the real ranges,
+        // prices the sweep, and is the only thing that can commit the split.  The enumeration above is skipped under
+        // pp (it optimizes the decode window), so this is the one path that places the pp fleet.
+        if (split_pp && best.empty()) {
             std::vector<int64_t> Lcap((size_t) ns, 0);
             for (int i = 0; i + 1 < ns; ++i) {
                 double cum = 0;
@@ -6862,7 +6903,7 @@ int main(int argc, char** argv) {
             }
             if (!best.empty())
                 std::fprintf(stderr, "strata generate: layer split auto: pp capacity-greedy placed %d stages "
-                                     "(the enumeration stops at four); the verification below holds it to the promise\n", ns);
+                                     "(the universal placer for the pp fleet); the verification below holds it to the promise\n", ns);
         }
         if (split_pp && best.empty()) {
             // M5-P3 (the owner's rule): the minimum stage is already ONE whole layer, so nothing found means the
