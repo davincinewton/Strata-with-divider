@@ -3581,7 +3581,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         // STRATA_HANDOFF_MODE=strict: the fleet's lockstep - this stage starts no chunk before its successor has
         // finished the previous one, so no two stages are ever computing (or copying) at the same time anywhere.
-        if (next_ != nullptr && handoff_serial() >= 2 && next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+        // (The same cancellation poll loop as serial's wait: never join a run a dropped session left hanging.)
+        if (next_ != nullptr && handoff_serial() >= 2 && next_run_.valid()) {
+            while (next_run_.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout)
+                if (should_stop && should_stop()) { err = "cancelled"; return false; }
+            if (!next_run_.get()) { err = next_err_; return false; }
+        }
         if (std::getenv("STRATA_TRACE")) {
             static Clock::time_point t0;   // process-wide: the stages run on different threads
             static bool set = false;
@@ -6457,8 +6462,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // STRATA_HANDOFF_MODE=serial: the buffer is single, so its last reader - the successor's run of the
             // PREVIOUS chunk, whose HtoD may still be queued on the successor's stream - must be done before this
             // chunk's rows are queued into it.  One host transfer per boundary, ever; the wait below (the same
-            // future, this time already consumed) becomes a no-op.
-            if (handoff_serial() >= 1 && next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+            // future, this time already consumed) becomes a no-op.  #879 taught the poll loop: a run abandoned by
+            // a dropped session can hang on its GPU work forever, and joining it forever would turn the serve
+            // path's retry into a watchdog stall over the dead attempt - so the wait yields to cancellation.
+            if (handoff_serial() >= 1 && next_run_.valid()) {
+                while (next_run_.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout)
+                    if (should_stop && should_stop()) { err = "cancelled"; return false; }
+                if (!next_run_.get()) { err = next_err_; return false; }
+            }
             // The current hand-off slot was last used hand_depth chunks ago (2 in the historical double buffer).
             float* h = m.hand[hand_buf_];
             const int hp = m.hand_pieces;
