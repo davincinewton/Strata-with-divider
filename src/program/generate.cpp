@@ -822,6 +822,10 @@ struct Options {
     int64_t prefill_auto_cap = 0;
     /// a bare `--prefill auto` (no ":N", no STRATA_PREFILL_AUTO_MAX): the gfx12 Linux rule below may raise its ceiling
     bool prefill_auto_bare = false;
+    /// the user typed an explicit `--prefill N` (not auto): a first-priority hard constraint.  If N cannot be funded
+    /// on every stage that owns its prompt buffers, the start REFUSES with a reason instead of silently stepping the
+    /// chunk down (the auto / divider-fleet default still steps down, as it always has).
+    bool prefill_explicit = false;
     /// 0.2.8 (Strix Halo on Windows): the prompt path keeps its own buffers by default (no lending), so `--prefill auto`
     /// must not fall back to 2048 ("reserved buffers, keep them small") - the gfx1151 rule above has already chosen a
     /// chunk that fits this box's carve-out.
@@ -3671,6 +3675,7 @@ int main(int argc, char** argv) {
                                      : (o.prefill_auto && env_max != nullptr ? std::atoll(env_max) : 8192);
             o.prefill_auto_max = want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
+            o.prefill_explicit = !o.prefill_auto;   // a named chunk is a first-priority constraint (auto is not)
             {   // #1630: Windows HIP, RX 7900 XTX: a first long prompt at 8192-token chunks charged ~70 GB of commit and
                 // killed the engine; 7500 and below were flat.  A bare auto stops at 6144; a chunk the user names stays.
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
@@ -6019,12 +6024,10 @@ int main(int argc, char** argv) {
     // (stage 0 has finished the window the chain follows), not beside the last stage's window on the last card, where the two
     // streams share the card and each takes ~2x as long (stage-1 window 11 -> 25 ms, chain 7 -> 21 ms, 2x R9700).  The chain's
     // source rows are copied over once per chain (stage_source_R), the draft head's rows once at load.
-    const bool mtp_first = [&] {
-        if (!mtp_first_ok || o.pipeline_windows < 2 || stages.empty() || batch_blocks_pw) return false;
-        const char* e = std::getenv("STRATA_MTP_STAGE0");
-        if (e != nullptr) return std::atoi(e) != 0;   // 0 keeps the drafter on the last card, 1 asks for the first
-        return mtp_first_default_on();
-    }();
+    // The drafter (and its draft head) always runs on the LAST card (Main): the biggest card, where the verify
+    // and the head already live.  STRATA_MTP_STAGE0 no longer moves it to the first card - keeping it on Main
+    // makes the split's VRAM accounting one-sided (the draft head is reserved on Main only).
+    const bool mtp_first = false;
     // DFlash2 on a layer split: its card is the LAST stage's by default (the head rows, the embedding path and the Main role are there; only the
     // earlier stages' taps cross, a few KB a window), or the FIRST stage's with STRATA_DF2_STAGE=first (a measurement seam, not a default).
     const bool df2_first = [&] {
@@ -6138,7 +6141,9 @@ int main(int argc, char** argv) {
             : 0;
     if (split_ring_mib > 0) strata::prefill::Prefill::set_ring_override(96);
     if (o.prefill_pipe >= 0.0) strata::prefill::Prefill::set_pipe(o.prefill_pipe);
-    const int64_t split_pf_mib =
+    // the rough prompt-buffer estimate; the search block below REPLACES this with the true Prefill::bytes_needed
+    // (a full-range reference session) so the divider layer count is priced against the real chunk cost.
+    int64_t split_pf_mib =
         (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 + split_ring_mib : 0;
     // ---- WHAT A STAGE RESERVES, AND ON WHICH STAGE.  The flat 1 GiB this used to withhold from EVERY stage
     // after the first was booked "for its windows and the drafter", but the windows measure 75 MiB ("window up
@@ -6236,7 +6241,7 @@ int main(int argc, char** argv) {
         // turns the search-time optimism off, so a promised placement reserves its real chunk (no serve-time shrink).
         const int64_t pf = (search && !split_pp && split_own_auto && !place_with_reserve && !pf_main_only)
                                ? 0
-                               : (pf_main_only && multi_gpu && !drafter) ? (split_pf_mib - split_ring_mib)
+                               : (pf_main_only && multi_gpu && !drafter && !split_own_auto) ? (split_pf_mib - split_ring_mib)
                                : split_pf_mib;
         // what a later stage allocates after its cache and nothing prices (cuBLAS, the modules and the MMQ pool the prompt path warms up, ~250 MiB measured): the single card prices
         // it (kLateAllocMib, #4474); a stage did not, and two 16 GB cards ended a start with 131 MiB free and ran out of memory in the first long prompt.  Not under STRATA_DEFAULTS=026.
@@ -6256,6 +6261,57 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int ns = (int) stages.size() + 1;
         std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
+        // FULL-RANGE REFERENCE: price the prompt buffers with the TRUE Prefill::bytes_needed (the same count the
+        // serve-time own_fits check makes), not the rough split_pf_mib estimate.  A reference session at the full
+        // layer range + max context over-counts any single stage's buffers (it holds every QSA layer's pages), so the
+        // divider layer count the search returns already leaves room for the real chunk - the chunk is funded, or the
+        // search says it cannot be.  The rough estimate under-counted a 2048 chunk by ~935 MiB, so the search
+        // over-allocated 3 layers to CUDA0 and serve then had to shrink the chunk.
+        if (split_pp && o.prefill_chunk > 0 && !pf_borrow) {
+            // a value-initialized session with the QSA states set the way the chunk_bytes lambda does (the real
+            // kv_mode / n_pages), so the count matches the serve-time own_fits check (the cudaMalloc'd reference
+            // ran before kv_mode was set and under-counted the KV host pools).
+            strata::core::qsa_set_kv_resident(o.kv_resident);   // the chunk_bytes lambda sets this; read it here too
+            const strata::kernels::QsaShapes sref = strata::core::qsa_shapes(g);
+            const int64_t ref_pages = (o.max_context + sref.page_size - 1) / sref.page_size;
+            int ref_mode = 0;
+            const int64_t ref_kv_res = strata::core::qsa_kv_resident();
+            if (ref_kv_res > 0) {
+                const int64_t r = (std::max(ref_kv_res, strata::core::qsa_kv_resident_min()) + sref.page_size - 1) / sref.page_size;
+                if (r < ref_pages) ref_mode = 1;
+            }
+            const bool ref_q4 = strata::core::qsa_kv_q4();
+            const bool ref_hyb = strata::core::qsa_kv_hybrid();
+            const bool ref_i8 = strata::core::qsa_kv_int8() && !ref_q4;
+            std::vector<strata::core::QsaState> ref_qs((size_t) g.n_qsa_layers());
+            for (int64_t j = 0; j < g.n_qsa_layers(); ++j) {
+                ref_qs[(size_t) j].max_cells = o.max_context;
+                ref_qs[(size_t) j].kv_mode = ref_mode;
+                ref_qs[(size_t) j].n_pages = ref_pages;
+                ref_qs[(size_t) j].kv_int8 = ref_i8;
+                ref_qs[(size_t) j].kv_q4 = ref_q4;
+                ref_qs[(size_t) j].kv_hybrid = ref_hyb;
+            }
+            strata::core::SessionState ref_ss{};
+            ref_ss.max_cells = o.max_context;
+            ref_ss.qsa_states = ref_qs.data();
+            ref_ss.qsa_ord0 = 0;
+            const strata::core::OnDevice on(0);
+            uint64_t ref_need = strata::prefill::Prefill::bytes_needed(g, ref_ss, o.prefill_chunk, false);
+            // the count above carries the 96-slot ring this function set as the override; a pp fleet's serve runs
+            // the streamed ring at STRATA_SPLIT_RING (384 by default).  Price the ring serve will actually allocate.
+            const int64_t ref_ring_slots = [] {
+                if (const char* e = std::getenv("STRATA_SPLIT_RING"); e != nullptr && *e) return (int64_t) std::atoll(e);
+                return (int64_t) 384;
+            }();
+            if (ref_ring_slots > 96)
+                ref_need += (uint64_t) (ref_ring_slots - 96) * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+            split_pf_mib = (int64_t) ((ref_need + (1ull << 20) - 1) >> 20);
+            std::fprintf(stderr, "strata generate: layer split: prompt buffers priced at the true %lld MiB for a "
+                                 "%lld-token chunk (the rough estimate was %lld MiB)\n",
+                        (long long) split_pf_mib, (long long) o.prefill_chunk,
+                        (long long) (160 + (o.prefill_chunk * 680) / 1024 + split_ring_mib));
+        }
         // (split_pp is read above, before stage_room, so the prompt-buffer honesty and the slack both see it.)
         // what stage i has left for experts if it runs [lb, le): its room, minus its session and (a later stage) its weights
         auto stage_left = [&](int i, int64_t lb, int64_t le) -> int64_t {
@@ -9074,9 +9130,21 @@ int main(int argc, char** argv) {
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
-        // the drafter and the head are already allocated by now (they load above, before this), so what is left
-        // to hold back is the windows - and `free_b` has already lost the drafter.
-        int64_t room = stage_room(st.dev, true, false);
+        // the drafter's LAYER is allocated above, but its DRAFT HEAD (the draft_vocab subset + the draft logits) is
+        // bound AFTER this loop (mtp.bind), so it is not in the free figure yet: hold it back here, or the cache
+        // below grows into it and the bind fails with "the draft head does not fit".  The head lives on the
+        // drafter's stage - the last by default, the first under STRATA_MTP_STAGE0=1 (mtp_first) - mirroring the
+        // primary-card reserve (mtp_bind at the "expert cache auto" sizing).
+        const int64_t mtp_head_b = [&] {
+            if (o.mtp.empty()) return (int64_t) 0;
+            const GpuStage* host = mtp_first ? stages.front().get() : last_st;   // mtp_first is always false: Main
+            if (host != &st) return (int64_t) 0;
+            // the split's main head is last_st->head (loaded above, before this loop); native_head for the non-split case
+            const strata::core::NativeHead* h = (last_st && last_st->head.loaded()) ? &last_st->head
+                                            : (native_head.loaded() ? &native_head : nullptr);
+            return h ? (int64_t) mtp.bind_bytes(h->row_bytes(), n_vocab) : 0;
+        }();
+        int64_t room = stage_room(st.dev, true, false) - mtp_head_b;
         const strata::core::OnDevice on(st.dev);
 #if defined(STRATA_HAVE_DFLASH2)
         // DFlash2's own draft head and logits (and, in serve, the prompt staging) are bound on its card AFTER the caches, as the single card prices them (mtp_bind above): without
@@ -9106,8 +9174,9 @@ int main(int argc, char** argv) {
         size_t fb = 0, tb = 0;
         {
             cudaMemGetInfo(&fb, &tb);
-            std::fprintf(stderr, "strata generate: layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB\n",
-                         st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0);
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB%s\n",
+                         st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0,
+                         mtp_head_b ? " (minus the MTP draft head bound after the cache)" : "");
         }
         std::vector<int64_t> sized;
         int64_t used = 0, want = 0;
@@ -11863,6 +11932,19 @@ int main(int argc, char** argv) {
                                      "unified pool; STRATA_PF_OWN_CHECK=1 steps the chunk down by that figure)\n",
                              (long long) o.prefill_chunk, (long long) (need >> 20), (long long) (fb >> 20));
               } else {
+                if (o.prefill_explicit) {
+                    // a named --prefill is a first-priority constraint: refuse the start with the reason, do not
+                    // silently shrink the chunk (the auto / divider-fleet default still steps down below).
+                    std::fprintf(stderr, "strata serve: the requested --prefill %lld-token chunk cannot be funded: its "
+                                         "prompt buffers need %lld MiB on CUDA%d, but only %lld MiB is free there after "
+                                         "its expert cache and session (a further %lld MiB headroom is held for the GEMM "
+                                         "workspaces).  A named chunk is a first-priority constraint, so this start "
+                                         "stops instead of shrinking it.  To serve: a smaller --prefill, a smaller "
+                                         "--max-context, a smaller --vram-reserve-mib, or more free VRAM on CUDA%d.\n",
+                                (long long) o.prefill_chunk, (long long) (need >> 20), dev, (long long) (fb >> 20),
+                                (long long) (kHeadroom >> 20), dev);
+                    return 1;
+                }
                 int64_t c = 0;
                 for (const int64_t s : kStepChunks) {
                     int d2 = 0;
@@ -11886,6 +11968,15 @@ int main(int argc, char** argv) {
             for (const int64_t c : kStepChunks)
                 if (c < o.prefill_chunk) { next = c; break; }
             if (r == 2 && next > 0) {
+                if (o.prefill_explicit) {
+                    // a named --prefill is a first-priority constraint: refuse, do not retry with a smaller chunk
+                    std::fprintf(stderr, "strata serve: the requested --prefill %lld-token chunk's buffers do not fit "
+                                         "(%s).  A named chunk is a first-priority constraint, so this start stops "
+                                         "instead of retrying with a smaller chunk.  To serve: a smaller --prefill, a "
+                                         "smaller --max-context, a smaller --vram-reserve-mib, or more free VRAM.\n",
+                                (long long) o.prefill_chunk, err.c_str());
+                    return 1;
+                }
                 std::fprintf(stderr, "strata serve: %s: trying a %lld-token chunk\n", err.c_str(), (long long) next);
                 // start the prompt paths over (a failed init may hold buffers), and consume the failed allocation's
                 // error: it is sticky, and the next launch check would report "out of memory" for a kernel
