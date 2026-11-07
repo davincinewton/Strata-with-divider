@@ -810,6 +810,12 @@ struct Options {
     int vram_reserve_later_mib = -1;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
+    /// PP-STREAM: with the pp promise on, this many non-Main stages NEXT TO MAIN run as STREAMING stages (the
+    /// config's helper cards): they stream their non-resident experts over their own links the way Main does, and
+    /// the whole-pair-set promise is not asked of them - the divider stages (the earlier ones) keep it.  0 (the
+    /// default): every non-Main stage is a divider, exactly as before.  The class is what the config says it is,
+    /// never a measured guess: card identity is not path identity.
+    int pp_stream = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  A chunk of
     /// stream_all_min tokens or more (1024 by default) streams every expert the GPU does not hold once, routed or not
     /// (a smaller one only the experts it routes to), so a bigger chunk streams fewer bytes per token (the "ubatch"
@@ -1193,6 +1199,10 @@ void usage() {
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend;\n"
                  "                       auto:16384 / auto:32768 (or STRATA_PREFILL_AUTO_MAX) allow bigger ones\n"
+                 "  --pp-stream N        with the pp promise (STRATA_SPLIT_PP=1): the N non-Main stages next to Main\n"
+                 "                       are the config's helper cards - they stream their experts over their own links\n"
+                 "                       and their layers come from the auto-split search, not the divider promise;\n"
+                 "                       0 (the default): every non-Main stage is a divider, as before\n"
                  "  --prefill-pipe R     opt-in, a layer split: prompt chunks sized so the stages read at once - R is\n"
                  "                       this PC's b/a in tokens (setup's --calibrate measures it); 1 only evens out\n"
                  "                       the buffers' chunk count (STRATA_PREFILL_EQUAL's rule); 0 off (default; or\n"
@@ -3693,6 +3703,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--prefill-pipe") o.prefill_pipe = std::max(0.0, std::atof(next("--prefill-pipe")));
+        else if (a == "--pp-stream") o.pp_stream = std::max(0, std::atoi(next("--pp-stream")));
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--vram-elastic") o.vram_elastic = true;
@@ -6233,6 +6244,9 @@ int main(int argc, char** argv) {
     // `stage_room` so the prompt-buffer honesty below sees it) and used by the fills' slack and the placement.  Off
     // by default -> the decode path stays byte-identical.
     bool split_pp = [] { const char* v = std::getenv("STRATA_SPLIT_PP"); return v != nullptr && v[0] == '1'; }();
+    if (o.pp_stream > 0 && !split_pp)
+        std::fprintf(stderr, "strata: --pp-stream %d is ignored: with no pp promise (STRATA_SPLIT_PP=1) every "
+                             "card already streams\n", o.pp_stream);
     auto stage_room = [&](int dev, bool later, bool drafter, bool search = false) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
@@ -6438,7 +6452,13 @@ int main(int argc, char** argv) {
         auto pp_slack_bytes = [](int64_t nl) -> int64_t {
             return (int64_t) (268435456.0 + 209715200.0 * (double) nl);   // 256 MiB + 0.2 GiB per layer
         };
-        auto pp_is_divider = [&](int i) -> bool { return split_pp && i + 1 < ns; };   // every stage but Main
+        // PP-STREAM: the LAST pp_stream_stages of the ns-1 non-Main stages are STREAMING stages (the config's
+        // helper cards): no pair set of their own to own, their non-resident experts sweep over their own links
+        // the way Main's do, and no promise asked of them.  The PROMISE stages - the dividers - are the first np.
+        // With no helpers configured this is exactly the old "every stage but Main", every loop below included.
+        const int pp_stream_stages = split_pp ? std::min(o.pp_stream, ns - 1) : 0;
+        const int np = ns - 1 - pp_stream_stages;
+        auto pp_promises = [&](int i) -> bool { return split_pp && i + 1 < ns && i < np; };
         // the predicted window time (ms) of a placement, and the routed mass its caches hold
         std::vector<int64_t> held_cnt((size_t) ns, 0);   // per-stage fill count, for the startability gate
         const int64_t kAutoLendPct = [] {
@@ -6456,7 +6476,7 @@ int main(int argc, char** argv) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
                 const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
                 // pp: reserve the honesty slack for a divider so what this fill promises is what serve can hold
-                capr[(size_t) i] = stage_left(i, lb, le) - (pp_is_divider(i) ? pp_slack_bytes(le - lb) : 0);
+                capr[(size_t) i] = stage_left(i, lb, le) - (pp_promises(i) ? pp_slack_bytes(le - lb) : 0);
             }
             std::fill(used.begin(), used.end(), 0);
             std::fill(held_cnt.begin(), held_cnt.end(), 0);
@@ -6470,7 +6490,7 @@ int main(int argc, char** argv) {
                 while (st + 1 < ns && l >= at[(size_t) st]) ++st;
                 mass_i[(size_t) st] += mass[r];
                 if (full[(size_t) st]) continue;
-                const int64_t add = pp_is_divider(st) ? (int64_t) ((double) cost(l) * kPpSlackPct) : cost(l);
+                const int64_t add = pp_promises(st) ? (int64_t) ((double) cost(l) * kPpSlackPct) : cost(l);
                 if (used[(size_t) st] + add > capr[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
                 used[(size_t) st] += add;
                 held_mass += mass[r];
@@ -6519,7 +6539,7 @@ int main(int argc, char** argv) {
         // (byte-identical).  Under pp the enumeration is skipped entirely and the capacity-greedy is the sole placer.
         // (split_pp is read above, before the fills, so the honesty slack below sees it.)
         std::vector<int64_t> pairs_L((size_t) g.n_layers, 0);
-        double pp_main_ms = 0;      // the winning placement's Main chunk time (compute + streamed sweep)
+        double pp_main_ms = 0;      // the winning placement's streaming-tail time (Main alone without helpers)
         double pp_sweep_gib = 0;    // ... and its streamed GiB per chunk, for the boot line
         if (split_pp)
             for (size_t r = 0; r < profile.size(); ++r)
@@ -6648,45 +6668,55 @@ int main(int argc, char** argv) {
         std::vector<std::pair<double, std::vector<int64_t>>> priced;
         // The pp pipeline beat (ms) of a placement, given each stage's held-pair count, or false if some divider
         // cannot hold its WHOLE profiled pair set (the promise).  Factored out so the `consider` path (ns 2/3 and
-        // the >=5 greedy) and the memoised ns==4 search score a placement on IDENTICAL pp arithmetic.  Also sets
-        // pp_main_ms / pp_sweep_gib for the boot line, exactly as the inline block did.
+        // the >=5 greedy) and the memoised ns==4 search score a placement on IDENTICAL pp arithmetic.  The tail's
+        // slowest-stage time and sweep GiB come out by reference: consider() records them for the boot line on the
+        // placement it KEEPS - with a streaming tail many candidates pass through here and the last is not the best.
         auto pp_time_of = [&](const std::vector<int64_t>& cuts, const std::vector<int64_t>& hc,
-                              double& pp_ms_out, int64_t& main_l_out) -> bool {
-            // every non-Main stage must hold its range's whole profiled pair set (the fill says what fits;
-            // anything short would re-stream over that stage's link during a prompt)
-            for (int i = 0; i + 1 < ns; ++i) {
+                              double& pp_ms_out, int64_t& main_l_out,
+                              double& tail_ms_out, double& sweep_gib_out) -> bool {
+            // every PROMISE stage must hold its range's whole profiled pair set (the fill says what fits;
+            // anything short would re-stream over that stage's link during a prompt).  PP-STREAM: a streaming
+            // stage is verified the way Main already is - no promise, its non-held pairs priced as a sweep.
+            for (int i = 0; i < np; ++i) {
                 const int64_t lb = i == 0 ? 0 : cuts[(size_t) i - 1], le = cuts[(size_t) i];
                 int64_t want = 0;
                 for (int64_t l = lb; l < le; ++l) want += pairs_L[(size_t) l];
                 if (hc[(size_t) i] < want) return false;
             }
             // pp time (M5-P2b, DIVIDER-PLAN 11.10): dividers hold everything and their prompt bytes are the
-            // hand-off - compute only.  Main pays its compute PLUS one streamed sweep of its layers' non-held
-            // pairs per chunk at its measured link: the sweep, not the compute, caps pp when Main carries too
-            // many layers for the slots it has left.
+            // hand-off - compute only.  The streaming tail (Main, and with PP-STREAM the helper stages before
+            // it) pays compute PLUS one streamed sweep of its layers' non-held pairs per chunk at its own
+            // measured link: the sweep, not the compute, caps pp when a streaming card carries more layers
+            // than the slots it has left.  No helpers configured, the tail is Main alone - the old arithmetic.
             double pp_ms = 0;
-            for (int i = 0; i + 1 < ns; ++i) {
+            for (int i = 0; i < np; ++i) {
                 const int64_t lb = i == 0 ? 0 : cuts[(size_t) i - 1], le = cuts[(size_t) i];
                 pp_ms = std::max(pp_ms, layer_ms[(size_t) i] * (double) (le - lb));
             }
+            double tail_ms = 0, sweep_bytes = 0;
+            for (int i = np; i < ns; ++i) {
+                const int64_t lb = i == 0 ? 0 : cuts[(size_t) i - 1];
+                const int64_t le = i + 1 < ns ? cuts[(size_t) i] : g.n_layers;
+                double s_ms = layer_ms[(size_t) i] * (double) (le - lb);
+                double bytes = 0;
+                int64_t pairs = 0;
+                for (int64_t l = lb; l < le; ++l) {
+                    pairs += pairs_L[(size_t) l];
+                    bytes += (double) pairs_L[(size_t) l] * (double) cost(l);
+                }
+                if (pairs > 0)
+                    bytes *= (double) (pairs - std::min(hc[(size_t) i], pairs)) / (double) pairs;
+                const double bw = link_gbps[(size_t) i];
+                if (bw > 0.0)
+                    s_ms += bytes / (1e6 * bw);   // GB/s -> ms per chunk at this chunk size
+                sweep_bytes += bytes;
+                tail_ms = std::max(tail_ms, s_ms);
+            }
             const int64_t m_lb = cuts[(size_t) ns - 2];
             const int64_t m_l = g.n_layers - m_lb;
-            double main_ms = layer_ms[(size_t) ns - 1] * (double) m_l;
-            double sweep_bytes = 0;
-            int64_t m_pairs = 0;
-            for (int64_t l = m_lb; l < g.n_layers; ++l) {
-                m_pairs += pairs_L[(size_t) l];
-                sweep_bytes += (double) pairs_L[(size_t) l] * (double) cost(l);
-            }
-            const int64_t held_m = hc[(size_t) ns - 1];
-            if (m_pairs > 0)
-                sweep_bytes *= (double) (m_pairs - std::min(held_m, m_pairs)) / (double) m_pairs;
-            const double bw = link_gbps[(size_t) ns - 1];
-            if (bw > 0.0)
-                main_ms += sweep_bytes / (1e6 * bw);   // GB/s -> ms per chunk at this chunk size
-            pp_ms = std::max(pp_ms, main_ms);
-            pp_main_ms = main_ms;
-            pp_sweep_gib = sweep_bytes / 1073741824.0;
+            pp_ms = std::max(pp_ms, tail_ms);
+            tail_ms_out = tail_ms;
+            sweep_gib_out = sweep_bytes / 1073741824.0;
             pp_ms_out = pp_ms;
             main_l_out = m_l;
             return true;
@@ -6703,13 +6733,14 @@ int main(int argc, char** argv) {
             if (ns <= 3) priced.emplace_back(ms, at);
             const double mx = stage_max(at);
             if (split_pp) {
-                double pp_ms = 0;
+                double pp_ms = 0, tail_ms = 0, sweep_gib = 0;
                 int64_t main_l = 0;
-                if (!pp_time_of(at, held_cnt, pp_ms, main_l)) return;   // a divider cannot keep the promise
+                if (!pp_time_of(at, held_cnt, pp_ms, main_l, tail_ms, sweep_gib)) return;   // a divider cannot keep the promise
                 const int64_t best_main = best.empty() ? g.n_layers + 1 : g.n_layers - best[(size_t) ns - 2];
                 if (pp_ms < best_max - tie_eps || (pp_ms <= best_max + tie_eps && main_l < best_main)) {
                     if (gate_on && !can_start(parts_of(at))) return;
                     best = at; best_ms = ms; best_mass = hm; best_held = held; best_max = pp_ms;
+                    pp_main_ms = tail_ms; pp_sweep_gib = sweep_gib;   // the boot line reports the KEPT placement
                 }
                 return;
             }
@@ -6773,13 +6804,13 @@ int main(int argc, char** argv) {
                 const size_t key = ((size_t) i * (size_t) L + (size_t) lb) * stride + (size_t) le;
                 if (held_mass_at[key] < 0.0) {
                     // one stage's own carve, exactly as `predict` prices it (pp: with the same honesty slack)
-                    const int64_t room = stage_left(i, lb, le) - (pp_is_divider(i) ? pp_slack_bytes(le - lb) : 0);
+                    const int64_t room = stage_left(i, lb, le) - (pp_promises(i) ? pp_slack_bytes(le - lb) : 0);
                     double hm = 0;
                     int64_t used = 0, cnt = 0;
                     for (size_t r = 0; r < profile.size(); ++r) {
                         const int64_t l = profile[r].first;
                         if (l < lb || l >= le) continue;
-                        const int64_t add = pp_is_divider(i) ? (int64_t) ((double) cost(l) * kPpSlackPct) : cost(l);
+                        const int64_t add = pp_promises(i) ? (int64_t) ((double) cost(l) * kPpSlackPct) : cost(l);
                         if (used + add > room) break;   // the fill stops exactly where predict's does
                         used += add;
                         hm += mass[r];
@@ -6908,9 +6939,13 @@ int main(int argc, char** argv) {
         // shaving keeps one slow divider from becoming the chain's beat.  consider() still verifies the real ranges,
         // prices the sweep, and is the only thing that can commit the split.  The enumeration above is skipped under
         // pp (it optimizes the decode window), so this is the one path that places the pp fleet.
+        // PP-STREAM phase A: the arithmetic runs over the PROMISE stages (the first np of the ns-1 non-Main ones).
+        // With no helpers configured np == ns - 1: every loop, every condition and the consider() below reduce to
+        // exactly the code this was before.  With helpers it fixes the divider PREFIX, and phase B places the tail.
+        std::vector<int64_t> pp_prefix;   // the divider cuts, when a streaming tail follows them
         if (split_pp && best.empty()) {
             std::vector<int64_t> Lcap((size_t) ns, 0);
-            for (int i = 0; i + 1 < ns; ++i) {
+            for (int i = 0; i < np; ++i) {
                 double cum = 0;
                 int64_t n = 0;
                 while (n + 1 < g.n_layers - (ns - 2)) {
@@ -6924,16 +6959,18 @@ int main(int argc, char** argv) {
                 }
                 Lcap[(size_t) i] = n;
             }
-            for (int shape = 0; shape < 2 && best.empty(); ++shape) {   // 0: max offload, 1: each divider one layer
+            // with a streaming tail, every tail stage (helpers and Main) keeps at least two layers to run on
+            const int64_t tail_reserve = pp_stream_stages > 0 ? 2 * (pp_stream_stages + 1) : 0;
+            for (int shape = 0; shape < 2 && (pp_stream_stages > 0 ? pp_prefix.empty() : best.empty()); ++shape) {
                 std::vector<int64_t> Lv((size_t) ns, 1);
                 if (shape == 0)
-                    for (int i = 0; i + 1 < ns; ++i) Lv[(size_t) i] = Lcap[(size_t) i];
+                    for (int i = 0; i < np; ++i) Lv[(size_t) i] = Lcap[(size_t) i];
                 for (int it = 0; it < 128; ++it) {
                     int64_t used = 0;
-                    for (int i = 0; i + 1 < ns; ++i) used += Lv[(size_t) i];
-                    if (used >= g.n_layers) {   // over-allocated: shave the largest divider
+                    for (int i = 0; i < np; ++i) used += Lv[(size_t) i];
+                    if (used + (tail_reserve > 0 ? tail_reserve - 1 : 0) >= g.n_layers) {   // over-allocated: shave the largest divider
                         size_t big = 0;
-                        for (int i = 1; i + 1 < ns; ++i)
+                        for (int i = 1; i < np; ++i)
                             if (Lv[(size_t) i] > Lv[big]) big = (size_t) i;
                         if (Lv[big] <= 1) break;
                         --Lv[big];
@@ -6942,7 +6979,7 @@ int main(int argc, char** argv) {
                     const double main_ms = (double) (g.n_layers - used) * layer_ms[(size_t) ns - 1];
                     int worst = -1;
                     double worst_ms = main_ms;
-                    for (int i = 0; i + 1 < ns; ++i) {
+                    for (int i = 0; i < np; ++i) {
                         const double d = (double) Lv[(size_t) i] * layer_ms[(size_t) i];
                         if (d > worst_ms + tie_eps) { worst_ms = d; worst = i; }
                     }
@@ -6951,25 +6988,64 @@ int main(int argc, char** argv) {
                 }
                 int64_t used = 0, c = 0;
                 bool ok = true;
-                for (int i = 0; i + 1 < ns; ++i) {
+                for (int i = 0; i < np; ++i) {
                     if (Lv[(size_t) i] < 1) { ok = false; break; }
                     used += Lv[(size_t) i];
                     c += Lv[(size_t) i];
-                    if (c >= g.n_layers) { ok = false; break; }
+                    if (c + (tail_reserve > 0 ? tail_reserve - 1 : 0) >= g.n_layers) { ok = false; break; }
                     (void) used;
                 }
-                if (!ok || c >= g.n_layers) continue;
+                if (!ok || c + (tail_reserve > 0 ? tail_reserve - 1 : 0) >= g.n_layers) continue;
                 int64_t p = 0;
                 at.assign((size_t) ns - 1, 0);
-                for (int i = 0; i + 1 < ns; ++i) {
+                for (int i = 0; i < np; ++i) {
                     p += Lv[(size_t) i];
                     at[(size_t) i] = p;
                 }
-                consider();
+                if (pp_stream_stages == 0) consider();
+                else pp_prefix = at;   // the first np entries carry the divider cuts; phase B fills the rest
             }
             if (!best.empty())
                 std::fprintf(stderr, "strata generate: layer split auto: pp capacity-greedy placed %d stages "
                                      "(the universal placer for the pp fleet); the verification below holds it to the promise\n", ns);
+        }
+        // PP-STREAM phase B: over the residual [K, n_layers) and the tail stages (the helpers ... Main), the SAME
+        // enumeration logic the auto split uses upstream - cuts searched after the divider prefix, every candidate
+        // scored by consider(): predict's per-stage fills and the pp arithmetic in pp_time_of (promise on the
+        // prefix, compute + sweep on the tail).  The promise arithmetic cannot say what a good-link streaming
+        // card's link and VRAM support; this is the model that can.
+        if (split_pp && pp_stream_stages > 0 && !pp_prefix.empty() && best.empty()) {
+            at = pp_prefix;
+            const int64_t K = np > 0 ? pp_prefix[(size_t) np - 1] : 0;
+            if (g.n_layers - K >= 2 * (pp_stream_stages + 1)) {
+                auto rec = [&](auto&& self, int idx, int64_t lo) -> void {
+                    if (idx == ns - 1) { consider(); return; }
+                    for (int64_t k = lo; k <= g.n_layers - 2 * (int64_t) ((size_t) (ns - 1) - (size_t) idx); ++k) {
+                        at[(size_t) idx] = k;
+                        self(self, idx + 1, k + 2);
+                    }
+                };
+                rec(rec, np, K + 2);
+            }
+            if (!best.empty()) {
+                std::string ks;
+                for (const int64_t k : best) ks += (ks.empty() ? "" : ",") + std::to_string(k);
+                std::fprintf(stderr, "strata generate: layer split auto: pp-stream: %d promise stage(s) fixed at "
+                                     "K=%lld, the %d-stage streaming tail searched its own placements - the tail of "
+                                     "K=%s (best of %lld placements)\n", np, (long long) K, pp_stream_stages + 1,
+                             ks.c_str(), (long long) tried);
+                // the #1616 note belongs to the TAIL the search placed - the promise stages' tiny ranges are the
+                // divider arithmetic's own, deliberate, choice (the pp placer has always allowed them)
+                int64_t tail_min = g.n_layers - best[(size_t) ns - 2];
+                for (int i = np; i < ns - 1; ++i)
+                    tail_min = std::min(tail_min, best[(size_t) i] - (i == 0 ? (int64_t) 0 : best[(size_t) i - 1]));
+                if (tail_min < strata::program::split_rules::kMinStageLayers)
+                    std::fprintf(stderr, "strata generate: layer split auto: pp-stream: a streaming stage runs only "
+                                         "%lld layers - a tiny expert cache there clamps the prompt chunk of every "
+                                         "card (#1616); the divider arithmetic left [%lld,%lld] for the streaming "
+                                         "tail: hand it more layers with an explicit --layer-split if the chunk "
+                                         "matters\n", (long long) tail_min, (long long) K, (long long) g.n_layers);
+            }
         }
         if (split_pp && best.empty()) {
             // M5-P3 (the owner's rule): the minimum stage is already ONE whole layer, so nothing found means the
@@ -6992,7 +7068,9 @@ int main(int argc, char** argv) {
             // WHOLE layers a divider fits at (ctx, chunk); Main fits layers without residency but must keep 512 MiB
             // of expert cache (a Main with no cache starves the pipeline whatever the promise says)
             auto whole_layers = [&](int i, int64_t ctx, int64_t chunk) -> int64_t {
-                const bool drafter = i + 1 == ns;
+                // PP-STREAM: a card the promise does not bind (Main, or a streaming stage) needs cache room,
+                // not residency
+                const bool drafter = i + 1 == ns || i >= np;
                 int64_t n = 0;
                 while (n < g.n_layers) {
                     const double need = drafter ? (double) (512ll << 20) : pair_layer * (double) (n + 1);
@@ -7004,7 +7082,7 @@ int main(int argc, char** argv) {
             auto feasible = [&](int64_t ctx, int64_t chunk) {
                 int64_t total = 0;
                 for (int i = 0; i + 1 < ns; ++i) {
-                    if (whole_layers(i, ctx, chunk) < 1) return false;
+                    if (i < np && whole_layers(i, ctx, chunk) < 1) return false;   // a promise stage needs room for >=1 layer
                     total += whole_layers(i, ctx, chunk);
                 }
                 return total + whole_layers(ns - 1, ctx, chunk) >= g.n_layers;
@@ -7123,9 +7201,10 @@ int main(int argc, char** argv) {
                      ks.c_str(), best_ms, (long long) best_held, profile.size(), 100.0 * best_mass, (long long) tried);
         if (split_pp)
             std::fprintf(stderr, "strata generate: layer split auto: pp-first - every divider stage holds its layers' full "
-                                 "pair set at this context (no re-stream during prompts); Main chunk %.1f ms "
+                                 "pair set at this context (no re-stream during prompts);%s %.1f ms "
                                  "(compute + %.2f GiB streamed sweep per %lld-token chunk at its link); decode window "
                                  "%.1f ms is advisory\n",
+                         pp_stream_stages > 0 ? " the streaming tail's slowest stage pays" : " Main chunk",
                          pp_main_ms, pp_sweep_gib, (long long) o.prefill_chunk, best_ms);
         // M5 budget print (the user's rule: the allocation and its weight-space math are shown, not assumed).
         // The chosen split's per-card ledger in the search's own numbers: what the card had, what its layers
@@ -9301,7 +9380,15 @@ int main(int argc, char** argv) {
             const bool fleet = (ppv != nullptr && ppv[0] == '1') || (pmv != nullptr && pmv[0] == '1');
             const bool pp_promise = ppv != nullptr && ppv[0] == '1';
             const bool last_stage = &st == &*stages.back();
-            if (fleet && !last_stage && filled + 8 < (int64_t) st.profile.size()) {
+            // PP-STREAM: the --pp-stream stages right before Main are verified the way Main is: re-streaming on
+            // their links is the design, not a broken promise.  (The config says which cards they are.)
+            bool pp_streamer = false;
+            if (pp_promise && o.pp_stream > 0 && stages.size() > 1)
+                for (size_t k = stages.size() - 1, s = 0; s < (size_t) o.pp_stream && k > 0; ++s) {
+                    --k;
+                    if (&*stages[k] == &st) { pp_streamer = true; break; }
+                }
+            if (fleet && !last_stage && !pp_streamer && filled + 8 < (int64_t) st.profile.size()) {
                 std::fprintf(stderr, "strata generate: layer split: WARNING CUDA%d holds only %lld of its %zu profiled "
                                      "pairs - it re-streams %lld pairs over its link during prompts; as a divider it "
                                      "must hold them all (fewer layers here, or a smaller --max-context)\n",
