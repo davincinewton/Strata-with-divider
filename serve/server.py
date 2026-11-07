@@ -3311,6 +3311,16 @@ def engine_args(cfg: dict) -> list[str]:
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
     if layer_split_of(cfg) and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
         args.append("--split-skip-if-fits")
+    # PP-STREAM: a pp fleet with Helper cards runs them as STREAMING stages - they stream their experts over their
+    # own links the way Main does, and the divider promise is not asked of them.  The count is the config's roles;
+    # a pp fleet's card order must place the Helper cards right before the Main card (pp fleets' orders are written
+    # by hand - divider.py's link rule - so this is a stated condition, not a re-sort).
+    if layer_split_of(cfg) and "--pp-stream" not in args:
+        _roles, _problem = gpu_roles.saved_roles(cfg)
+        _help = sum(1 for r in (_roles or {}).values() if r == "helper")
+        _pp = str((cfg.get("env") or {}).get("STRATA_SPLIT_PP") or os.environ.get("STRATA_SPLIT_PP") or "") == "1"
+        if _pp and _help > 0:
+            args += ["--pp-stream", str(_help)]
     # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
     # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512)
     if cfg.get("vram_elastic") is True and "--vram-elastic" not in args:
