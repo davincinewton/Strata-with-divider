@@ -4268,6 +4268,15 @@ int main(int argc, char** argv) {
     }
     const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
                                o.expert_cache_remote[2] > 0;
+    // Helper plan: a DEDICATED pp partner - a helper GPU that runs no stage also computes a share of the head
+    // stage's experts while the head reads its prompt (the idle-stage help with the next stage's GPU stays as it
+    // was).  Opt-in: a layer split, a helper GPU, STRATA_PREFILL_HELP=1, no batch slots.  partner_reserve is the
+    // prompt context the partner will need on its card, sized below where the cache's auto-fill runs: the fill
+    // must leave that room over its 512 MiB floor, the context itself is created after the split search.
+    const bool partner_wanted = remote_caches && multi_gpu && o.batch <= 0 &&
+                                std::getenv("STRATA_PREFILL_HELP") != nullptr &&
+                                std::atoi(std::getenv("STRATA_PREFILL_HELP")) != 0;
+    uint64_t partner_reserve = 0;
     // A layer split keeps the resident RAM mode: every stage's GPU cache is left out of the RAM copy, and an adaptive
     // swap copies an evicted expert back from the card that owns its layer (resident_stage_swaps).
     // The helper-GPU caches are allowed beside the resident RAM mode too: their experts are left out of the RAM copy
@@ -9529,11 +9538,22 @@ int main(int argc, char** argv) {
             for (const auto& pr : st->profile)
                 if (st->cache.slot_of(pr.first, pr.second) >= 0)
                     claimed[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
+        // The partner's room, priced like the prompt path the split search prices (bytes_needed_owned: the chunk's
+        // own buffers and the ring, per-allocation page roundings) plus 512 MiB of slack for what init adds around
+        // them (the PLE buffers, the ident table, the MMQ context, events).  An --prefill auto chunk prices at the
+        // ceiling and only shrinks later, so the reservation stays an upper bound.
+        if (partner_wanted && partner_reserve == 0) {
+            if (o.prefill_chunk > 0)
+                partner_reserve = strata::prefill::Prefill::bytes_needed_owned(g, ss, o.prefill_chunk) + (512ull << 20);
+            else
+                std::fprintf(stderr, "strata generate: the pp partner needs --prefill (auto or N) to size its "
+                                     "buffers; the helper will serve decode only\n");
+        }
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
             if (remote_opt) remote_opt->attach(remote_experts[(size_t) r]);
             if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
                      g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err,
-                     o.expert_cache_remote_auto[(size_t) r])) {
+                     o.expert_cache_remote_auto[(size_t) r], partner_reserve)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -11313,15 +11333,21 @@ int main(int argc, char** argv) {
         // STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path may take a blob a helper's VRAM cache already
         // holds from that cache instead of reading the files again.  The helpers are idle while a prompt is read
         // (the serve path is serial: no batch slots), so the copy needs no ordering against their kernel streams.
-        // Everything else - the fallback's batched unbuffered reads, its pinned RAM copy, the prompt path's own
-        // decisions - is forwarded unchanged.  Default off: the prompt path's source is srcp, exactly as before.
+        // A layer split is allowed too (helper plan Phase 4): the head's prompt path reads the helper's copy while
+        // the helper's kernels may be computing partner rows - reads against reads are safe, and the cache slots
+        // only change during a decode window's swap-in, which cannot overlap the prompt when the pipelined windows
+        // are off (they are off by default with helper caches; --pipeline-windows 2 asked for explicitly keeps the
+        // source off, with the line below).  Everything else - the fallback's batched unbuffered reads, its pinned
+        // RAM copy, the prompt path's own decisions - is forwarded unchanged.  Default off: the prompt path's
+        // source is srcp, exactly as before.
         std::vector<strata::core::RemoteExperts*> prefill_helpers;
         for (int r = 0; r < drive.d.remote_count; ++r) prefill_helpers.push_back(drive.d.remote[r]);
         std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_src;
         strata::core::ExpertSource* prefill_src = srcp;
         uint64_t helper_blobs_before = 0, helper_bytes_before = 0;
         if (const char* hv = std::getenv("STRATA_PREFILL_HELPER_SOURCE"); hv != nullptr && std::atoi(hv) != 0 &&
-            srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
+            srcp != nullptr && o.batch <= 0 && !prefill_helpers.empty() &&
+            (stages.empty() || o.pipeline_windows <= 0)) {
             prefill_helper_src = std::make_unique<strata::core::RemotePrefillSource>(*srcp, prefill_helpers);
             prefill_src = prefill_helper_src.get();
             std::fprintf(stderr, "strata serve: the prompt path reads the experts a helper cache holds from that "
@@ -12019,7 +12045,49 @@ int main(int argc, char** argv) {
                 if (!sp.set_peer(&peer, rows, err)) {
                     std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
                     err.clear();
-                    (void) cudaGetLastError();   // (as above)
+                    (void) cudaGetLastError();   // a failed allocation here must not end the engine at the next kernel's check
+                }
+            }
+            // Helper plan: the DEDICATED pp partner. The helper GPU runs no stage; this Prefill gives it a prompt
+            // context - product buffers, ring, MMQ context - that is never run, only bound to by the head stage's
+            // help.  Its room on the card is what the cache's auto-fill left over the reserve above.  The blob bytes
+            // it streams come from the head's source pointers (the head issues them onto the partner's streams);
+            // reading the partner's OWN cache slots for local hits is a later step, not this one.
+            std::unique_ptr<strata::prefill::Prefill> partner_ctx;
+            if (partner_wanted && partner_reserve > 0) {
+                int phdev = -1;
+                for (int r = 0; r < 3; ++r)
+                    if (o.expert_cache_remote[(size_t) r] > 0 && phdev < 0) phdev = remote_dev[r];
+                const strata::core::OnDevice on(phdev);
+                cudaStream_t pstream = nullptr;
+                if (phdev < 0 || cudaStreamCreateWithFlags(&pstream, cudaStreamNonBlocking) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the pp partner has no helper device or stream; the head reads "
+                                         "its prompts alone\n");
+                } else {
+                    partner_ctx = std::make_unique<strata::prefill::Prefill>();
+                    if (!partner_ctx->init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk,
+                                           (void*)pstream, err)) {
+                        std::fprintf(stderr, "strata serve: the pp partner's prompt context does not fit on CUDA%d "
+                                             "(%s); the head reads its prompts alone\n", phdev, err.c_str());
+                        err.clear();
+                        (void) cudaGetLastError();
+                        partner_ctx.reset();
+                    } else if (!sp.set_stage_helper(partner_ctx.get(), err)) {
+                        std::fprintf(stderr, "strata serve: %s - the head reads its prompts alone\n", err.c_str());
+                        err.clear();
+                        (void) cudaGetLastError();
+                        partner_ctx.reset();
+                    } else {
+                        std::fprintf(stderr, "strata serve: CUDA%d is the head's pp partner (STRATA_PREFILL_HELP): it "
+                                             "streams and computes a share of the head's experts while the head reads "
+                                             "a one-chunk prompt (the share and the eligibility are Strata's "
+                                             "measured help rule)\n", phdev);
+                        // the partner is another host link with DMA of its own (blobs in, activations out, rows
+                        // back); it stays OUTSIDE the hand-off transfer token, which is correct while no helper
+                        // shares a PCIe switch with a stage - the helper's device is chosen among the GPUs that
+                        // run no stage, so on a rig whose weak links are switches, park helpers on the direct
+                        // slots (docs/SECOND_GPU.md, and this fork's splitter measurements)
+                    }
                 }
             }
             // a layer split: a one-chunk prompt runs the stages one after the other, so each stage's prompt path gets the
@@ -12028,10 +12096,12 @@ int main(int argc, char** argv) {
                 std::vector<std::pair<strata::prefill::Prefill*, int>> paths{{&sp, 0}};
                 for (const auto& st : stages) paths.emplace_back(&st->sp, st->dev);
                 for (size_t i = 0; i < paths.size(); ++i) {
+                    if (i == 0 && partner_ctx) continue;   // the head's partner is its dedicated helper, not a stage
                     const strata::core::OnDevice on(paths[i].second);
                     if (!paths[i].first->set_stage_helper(paths[(i + 1) % paths.size()].first, err)) {
                         std::fprintf(stderr, "strata serve: %s - stage %zu reads its prompts alone\n", err.c_str(), i);
                         err.clear();
+                        (void) cudaGetLastError();   // (as above)
                     }
                 }
             }

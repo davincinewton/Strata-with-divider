@@ -30,7 +30,8 @@ public:
     bool open(int device, int slots, int64_t layers, int64_t experts,
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
-              std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false);
+              std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false,
+              uint64_t extra_reserve = 0);   // bytes the fill must leave over the 512 MiB floor (a pp partner's prompt context)
     void close();
 
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),
