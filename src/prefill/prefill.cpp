@@ -504,10 +504,13 @@ static bool handoff_pipe_worker() {
 }
 // STRATA_HANDOFF_MODE=serial|strict: the llama.cpp-shaped hand-off for fabrics that cannot take the pipelined one
 // (measured: a 3-way PCIe Gen2 x1 splitter wedges with the pipelined hand-off at ANY chunk size, llama.cpp's
-// serialized worker survives it).  serial: ONE plain-pinned (not Portable-mapped) staging buffer, and the producer
-// waits for its direct successor's previous chunk BEFORE queueing the next DtoH - the buffer a successor reads is
-// never being written by the chunk behind it, so at most one host transfer per boundary is ever live.  strict:
-// also wait before computing the next chunk - the fleet runs one chunk at a time, the llama.cpp lockstep.
+// serialized worker survives it).  serial: ONE plain-pinned (not Portable-mapped) staging buffer per boundary, the
+// producer still waits for its direct successor's previous chunk before writing the next one - but the compute of
+// every stage runs free, and what makes the shape safe is the TRANSFER TOKEN below: every hand-off leg, in the
+// whole fleet, holds that one lock while its bytes are on the wire, so no two host links are ever DMA-active at
+// the same instant (measured: without the token, two boundaries' legs interleaving is what kills even a depth-1
+// hand-off; with it, the fabric's own failure signature disappears while throughput stays serial's).  strict:
+// additionally waits before computing - the fleet runs one chunk at a time, the llama.cpp lockstep.
 static int handoff_serial() {
     static const int v = [] {
         const char* e = std::getenv("STRATA_HANDOFF_MODE");
@@ -515,6 +518,14 @@ static int handoff_serial() {
         return std::strcmp(e, "serial") == 0 ? 1 : (std::strcmp(e, "strict") == 0 ? 2 : 0);
     }();
     return v;
+}
+// The transfer token (serial): one global lock around the hand-off legs' DMA.  A timed_mutex because every wait
+// polls should_stop (#879's lesson: never block a wedge's witness into a watchdog stall over a dead attempt).
+static std::timed_mutex& handoff_leg() { static std::timed_mutex m; return m; }
+static bool handoff_leg_take(std::string& err, const std::function<bool()>& stop) {
+    while (!handoff_leg().try_lock_for(std::chrono::milliseconds(50)))
+        if (stop && stop()) { err = "cancelled"; return false; }
+    return true;
 }
 // STRATA_RING_TRACE: the stall-search probes' gate (prints nothing when unset; default path unchanged)
 static bool ring_trace_on() {
@@ -3648,8 +3659,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
         } else if (hand_in_ != nullptr) {
-            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
-                cudaSuccess) {
+            if (handoff_serial() == 1) {
+                // serial's upload leg: the token is held across the copy AND its sync, so the leg releases only
+                // when its bytes have fully landed - no other link starts while this one is still draining.
+                if (!handoff_leg_take(err, should_stop)) return false;
+                const bool ok = cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4,
+                                                cudaMemcpyHostToDevice, m.cs) == cudaSuccess &&
+                                cudaStreamSynchronize(m.cs) == cudaSuccess;
+                handoff_leg().unlock();
+                if (!ok) {
+                    err = std::string("prefill: the layer split's hand-off upload leg failed: ") +
+                          cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            } else if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice,
+                                       m.cs) != cudaSuccess) {
                 err = "prefill: the layer split's hand-off upload failed";
                 return false;
             }
@@ -6460,9 +6484,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fflush(stderr);
             };
             // STRATA_HANDOFF_MODE=serial: the buffer is single, so its last reader - the successor's run of the
-            // PREVIOUS chunk, whose HtoD may still be queued on the successor's stream - must be done before this
-            // chunk's rows are queued into it.  One host transfer per boundary, ever; the wait below (the same
-            // future, this time already consumed) becomes a no-op.  #879 taught the poll loop: a run abandoned by
+            // PREVIOUS chunk - must be fully done before this chunk's rows are written into it; the token below
+            // makes that write wait its turn behind every other leg's bytes, and the wait below (the same future,
+            // this time already consumed) becomes a no-op.  #879 taught the poll loop: a run abandoned by
             // a dropped session can hang on its GPU work forever, and joining it forever would turn the serve
             // path's retry into a watchdog stall over the dead attempt - so the wait yields to cancellation.
             if (handoff_serial() >= 1 && next_run_.valid()) {
@@ -6502,6 +6526,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (cudaEventSynchronize(m.hand_done[hand_buf_]) != cudaSuccess) {
                     err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            } else if (handoff_serial() == 1) {
+                // serial's download leg: this stage's compute finishes OUTSIDE the token (it is not wire time),
+                // then the token is held across the copy AND its sync - the leg releases only when its bytes have
+                // fully landed, so exactly one host link anywhere carries activation bytes at any instant.
+                if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                    err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (!handoff_leg_take(err, should_stop)) return false;
+                const bool ok = cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) ==
+                                    cudaSuccess &&
+                                cudaStreamSynchronize(m.cs) == cudaSuccess;
+                handoff_leg().unlock();
+                if (!ok) {
+                    err = std::string("prefill: the layer split's hand-off leg: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
             } else {
