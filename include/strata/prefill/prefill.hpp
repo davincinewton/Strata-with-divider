@@ -245,7 +245,9 @@ public:
     /// them back - the --peer-device peer's streaming, without P2P (activations and rows through mapped host memory,
     /// read by copy kernels).  Only on the MMQ prompt path, only for chunks of stream_all_min() tokens and more, up to
     /// the size where the measured share stops paying.  Opt-in: STRATA_PREFILL_HELP=1 (not bit-identical to the default).  Both stages must have
-    /// run `init`.
+    /// run `init`.  The helper may also be a DEDICATED partner (a helper GPU that runs no stage, given a prompt
+    /// context by the serve path): same gate, same measured share, same one-chunk eligibility - only the card
+    /// behind the buffers differs.
     bool set_stage_helper(Prefill* helper, std::string& err);
 
     /// The CPU expert pool (decode's, idle while a prompt is read). With STRATA_PREFILL_CPU_SHARE set, a chunk below
