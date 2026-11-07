@@ -1142,7 +1142,8 @@ void usage() {
                  "                       STRATA_PIPELINE_AUTO=0 or N=0 turns it off): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
                  "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTI_GPU.md\n"
-                 "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
+                 "  --trim-stage-weights on for any layer split: each GPU loads only its own layers' dense weights\n"
+                 "                       (off with STRATA_STAGE_TRIM=0)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
                  "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
@@ -5103,13 +5104,13 @@ int main(int argc, char** argv) {
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
     // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the
-    // expert cache wants.  Opt-in, STRATA_STAGE_TRIM=1, on HIP and CUDA alike: measured on 2x MI50 (PR #639),
-    // and the default waits for its author's re-run of the release branch on his cards.
+    // expert cache wants.  THE DEFAULT since 0.1.55-sq: measured on 2x MI50 (PR #639), then carried by every
+    // divider config of this fork's CUDA fleets day in, day out; STRATA_STAGE_TRIM=0 restores the full copies.
     const std::set<std::string> skip_base = skip;
-    // --trim-stage-weights (PR #559) is the same switch as STRATA_STAGE_TRIM=1 (PR #639)
-    bool trim_asked = o.trim_stage_weights || [] {
+    // --trim-stage-weights (PR #559) is the same switch as STRATA_STAGE_TRIM (PR #639), now on unless set to 0
+    const bool trim_asked = o.trim_stage_weights || [] {
         const char* v = std::getenv("STRATA_STAGE_TRIM");
-        return v != nullptr && v[0] != 0 && std::string(v) != "0";
+        return v == nullptr || v[0] == 0 || std::string(v) != "0";
     }();
     // ---- THE LAYER SPLIT'S SPILL WALK, STEP 1 (include/strata/program/split_walk.hpp), EARLY: THE TRIM FOR EVERY CARD, CUDA0 TOO.  Under `--layer-split auto` CUDA0's weights load before the
     // search has chosen the split, so it could not be trimmed.  When the cards in the split are short (two 8 GB cards: every card would carry a 3.5 GiB copy of the dense set beside its

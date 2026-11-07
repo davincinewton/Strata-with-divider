@@ -590,8 +590,9 @@ ninja -C build-906 strata
 | QSA prompt attention | The FP32 kernel | none |
 
 **Two cards: try `--pipeline-windows 2` (off by default on gfx906).** The first card starts the next verify window while the
-second still verifies this one ([MULTI_GPU.md](MULTI_GPU.md)). Add `--trim-stage-weights` with the explicit `--layer-split`.
-In the config: `"args": [ ..., "--pipeline-windows", "2", "--trim-stage-weights" ]`. `--pipeline-windows 0` is the plain loop.
+second still verifies this one ([MULTI_GPU.md](MULTI_GPU.md)). Each card already loads only its own layers' dense
+weights (`--trim-stage-weights` is on for a split; `STRATA_STAGE_TRIM=0` restores the full copies).
+In the config: `"args": [ ..., "--pipeline-windows", "2" ]`. `--pipeline-windows 0` is the plain loop.
 `--batch` did not help a single interactive user. Nobody has compared the tokens against the serial loop on gfx906.
 
 > **Measured on:** 2x Instinct MI50 16 GB, Ryzen 7 5700X, 64 GB DDR4-3600, ROCm 7.14 (community image), engine 0.1.43.1,
