@@ -502,22 +502,44 @@ static bool handoff_pipe_worker() {
     static const bool v = [] { const char* e = std::getenv("STRATA_HANDOFF_PIPE_WORKER"); return !e || std::atoi(e) != 0; }();
     return handoff_pipe_pieces() > 0 && v;
 }
-// STRATA_HANDOFF_MODE=serial|strict: the llama.cpp-shaped hand-off for fabrics that cannot take the pipelined one
-// (measured: a 3-way PCIe Gen2 x1 splitter wedges with the pipelined hand-off at ANY chunk size, llama.cpp's
-// serialized worker survives it).  serial: ONE plain-pinned (not Portable-mapped) staging buffer per boundary, the
-// producer still waits for its direct successor's previous chunk before writing the next one - but the compute of
-// every stage runs free, and what makes the shape safe is the TRANSFER TOKEN below: every hand-off leg, in the
-// whole fleet, holds that one lock while its bytes are on the wire, so no two host links are ever DMA-active at
-// the same instant (measured: without the token, two boundaries' legs interleaving is what kills even a depth-1
-// hand-off; with it, the fabric's own failure signature disappears while throughput stays serial's).  strict:
-// additionally waits before computing - the fleet runs one chunk at a time, the llama.cpp lockstep.
+// STRATA_HANDOFF_MODE=pipeline|serial|strict, serial when the variable is unset.  The three shapes:
+// pipeline - the original hand-off: double-buffered Portable-mapped staging, the legs uncoordinated, the stages
+//   overlap freely.  Fast on fabrics where every stage owns its link (measured clean on 2+2+main over two
+//   independent links); it wedges a 3-way PCIe Gen2 x1 splitter at ANY chunk size (stalls, Xid 69, #879 logits,
+//   illegal memory access after a hop).
+// serial - THE DEFAULT, and the llama.cpp-shaped answer to that fabric: ONE plain-pinned (not Portable-mapped)
+//   staging buffer per boundary, the producer still waits for its direct successor's previous chunk before
+//   writing the next one - but the compute of every stage runs free, and what makes the shape safe is the
+//   TRANSFER TOKEN below: every hand-off leg, in the whole fleet, holds that one lock while its bytes are on
+//   the wire, so no two host links are ever DMA-active at the same instant (measured: without the token, two
+//   boundaries' legs interleaving is what kills even a depth-1 hand-off; with it, the fabric's failure
+//   signature disappears while throughput stays serial's: ~381 tok/s on 3 stages behind the splitter against
+//   strict's 318-351).
+// strict - serial plus the wait before computing: the fleet runs one chunk at a time, the llama.cpp lockstep.
+//   Kept as the reference shape; it is what proved the fault was transfer concurrency, not compute.
+// An unset variable means serial, and every start that has a hand-off prints its mode once (a config that lost
+// the line, or a name misspelled, says what it actually got).
 static int handoff_serial() {
     static const int v = [] {
         const char* e = std::getenv("STRATA_HANDOFF_MODE");
-        if (e == nullptr) return 0;
-        return std::strcmp(e, "serial") == 0 ? 1 : (std::strcmp(e, "strict") == 0 ? 2 : 0);
+        if (e == nullptr) return 1;
+        if (std::strcmp(e, "strict") == 0) return 2;
+        if (std::strcmp(e, "pipeline") == 0 || std::strcmp(e, "pipelined") == 0) return 0;
+        if (std::strcmp(e, "serial") == 0) return 1;
+        std::fprintf(stderr, "strata prefill: STRATA_HANDOFF_MODE=\"%s\" is not pipeline, serial or strict; "
+                             "using serial\n", e);
+        return 1;
     }();
     return v;
+}
+static void handoff_mode_report() {
+    static const bool once = [] {
+        const int m = handoff_serial();
+        const char* why = std::getenv("STRATA_HANDOFF_MODE") == nullptr ? " (the default)" : "";
+        std::fprintf(stderr, "strata prefill: hand-off mode: %s%s\n", m == 2 ? "strict" : m == 0 ? "pipeline" : "serial", why);
+        return true;
+    }();
+    (void) once;
 }
 // The transfer token (serial): one global lock around the hand-off legs' DMA.  A timed_mutex because every wait
 // polls should_stop (#879's lesson: never block a wedge's witness into a watchdog stall over a dead attempt).
@@ -1931,6 +1953,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
     if (next_ != nullptr) {   // STRATA_HANDOFF_DEPTH: the hand-off buffers' count (the 7-stage rows let the head
+        handoff_mode_report();   // a start with a hand-off says once which mode its env selects
         const char* hd = std::getenv("STRATA_HANDOFF_DEPTH");   // outrun the 2-deep history a slow consumer keeps)
         if (hd) { int v = std::atoi(hd); if (v < (handoff_serial() > 0 ? 1 : 2)) v = handoff_serial() > 0 ? 1 : 2; if (v > 8) v = 8; m.hand_depth = v; }
         else if (handoff_serial() > 0) m.hand_depth = 1;   // STRATA_HANDOFF_MODE: serial's default is the one buffer
