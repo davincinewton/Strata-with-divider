@@ -5128,7 +5128,7 @@ int main(int argc, char** argv) {
     // divider config of this fork's CUDA fleets day in, day out; STRATA_STAGE_TRIM=0 restores the full copies.
     const std::set<std::string> skip_base = skip;
     // --trim-stage-weights (PR #559) is the same switch as STRATA_STAGE_TRIM (PR #639), now on unless set to 0
-    const bool trim_asked = o.trim_stage_weights || [] {
+    bool trim_asked = o.trim_stage_weights || [] {
         const char* v = std::getenv("STRATA_STAGE_TRIM");
         return v == nullptr || v[0] == 0 || std::string(v) != "0";
     }();
@@ -9425,6 +9425,7 @@ int main(int argc, char** argv) {
                 break;
             }
         }
+    }
         // M5 budget print: Main's ledger too (its dense is loaded in the normal loop, so it is the priced figure).
         const strata::core::OnDevice on0(primary_device);
         size_t fb0 = 0, tb0 = 0;
